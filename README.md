@@ -62,7 +62,7 @@ These are logged automatically to `~/traffic_rl/logs/` and aggregated into `pair
 
 
 
-##🚦 Adaptive Traffic RL — Setup & Deployment
+🚦 Adaptive Traffic RL — Setup & Deployment
 
 1) Clone the repo
 
@@ -126,6 +126,7 @@ Don’t commit massive SUMO detector outputs or CSV logs.
 👥 Contributors
 
 Jeremy Wanjohi — System design, RL integration, dashboard
+
 
 
 
