@@ -60,7 +60,7 @@ The dashboard uses `streamlit-authenticator` with YAML-based credentials (`auth_
 
 These are logged automatically to `~/traffic_rl/logs/` and aggregated into `paired_summary.csv`.
 
----
+
 
 ##🚦 Adaptive Traffic RL — Setup & Deployment
 
@@ -126,5 +126,6 @@ Don’t commit massive SUMO detector outputs or CSV logs.
 👥 Contributors
 
 Jeremy Wanjohi — System design, RL integration, dashboard
+
 
 
