@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+import os, json, time, traci, sumolib, sys
+
+SUMO_BINARY = "sumo"
+SUMO_CFG = os.path.expanduser("~/traffic_rl/junctions/uhuru/baseline.sumocfg")
+STATE_PATH = os.path.expanduser("~/traffic_rl/shared/state.json")
+SAMPLE_RATE = 10  # Sample every 10 simulation seconds
+
+def get_state():
+    """Extracts the current state from TraCI."""
+    vehs = traci.vehicle.getIDList()
+    if not vehs:
+        return {
+            "step": traci.simulation.getTime(),
+            "veh_count": 0,
+            "avg_wait": 0.0,
+            "avg_speed": 0.0
+        }
+
+    wait = [traci.vehicle.getWaitingTime(v) for v in vehs]
+    avg_speed = sum(traci.vehicle.getSpeed(v) for v in vehs) / len(vehs)
+    return {
+        "step": traci.simulation.getTime(),
+        "veh_count": len(vehs),
+        "avg_wait": round(sum(wait) / len(wait), 2),
+        "avg_speed": round(avg_speed, 2)
+    }
+
+def main():
+    sumo_cmd = [SUMO_BINARY, "-c", SUMO_CFG, "--start", "--no-step-log", "true", "--time-to-teleport", "-1"]
+    
+    try:
+        traci.start(sumo_cmd)
+        while (traci.simulation.getMinExpectedNumber() > 0 or traci.simulation.getLoadedNumber() > 0):
+            traci.simulationStep()
+            if traci.simulation.getTime() % SAMPLE_RATE == 0:
+                state = get_state()
+                try:
+                    with open(STATE_PATH, "w") as f:
+                        json.dump(state, f)
+                except IOError as e:
+                    print(f"Error writing to state file: {e}", file=sys.stderr)
+                    
+    except traci.TraCIException as e:
+        print(f"TraCI connection error: {e}", file=sys.stderr)
+    finally:
+        if traci.isLoaded():
+            traci.close()
+            print("TraCI connection closed.")
+
+if __name__ == "__main__":
+    main()

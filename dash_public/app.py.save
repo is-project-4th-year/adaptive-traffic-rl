@@ -1,0 +1,269 @@
+
+    # Normalize column names
+    df = df.rename(columns={
+        "timestamp": "ts",
+        "queue_len": "avg_queue"
+    })
+
+    # Ensure required columns exist
+    for col in ["ts", "avg_speed", "avg_wait", "avg_queue", "action"]:
+        if col not in df.columns:
+            df[col] = 0.0
+
+    # Clean & sort
+    df = df.replace([np.inf, -np.inf], np.nan)
+    df = df.dropna(subset=["avg_speed", "avg_wait"], how="any")
+    df["ts"] = pd.to_numeric(df["ts"], errors="coerce")
+    df = df.dropna(subset=["ts"])
+    df["ts"] = pd.to_datetime(df["ts"], unit="s", errors="coerce", utc=True).dt.tz_convert("Africa/Nairobi")
+    df = df.sort_values("ts").reset_index(drop=True)
+
+    return df
+
+
+def safe_pct(new, old):
+    old = old if abs(old) > 1e-6 else 1e-6
+    return ((new - old) / old) * 100
+
+
+def safe_mean(df, col):
+    return df[col].mean() if col in df.columns and not df.empty else 0.0
+
+
+def clip_numeric(df, lo=0, hi=1e4):
+    if df.empty:
+        return df
+    num_cols = df.select_dtypes(include=[np.number]).columns
+    df = df.copy()
+    df[num_cols] = df[num_cols].clip(lower=lo, upper=hi)
+    return df
+
+
+def roll(df, cols=("avg_speed","avg_wait","avg_queue"), win=15):
+    if df.empty: 
+        return df
+    df = df.copy()
+    for c in cols:
+        if c in df:
+            df[c+"_r"] = df[c].rolling(window=win, min_periods=max(3, win//3)).mean()
+    return df
+
+
+def download_link(df, filename):
+    buf = io.StringIO()
+    df.to_csv(buf, index=False)
+    st.download_button("Download CSV", data=buf.getvalue(), file_name=filename, mime="text/csv")
+
+
+# ------------------------------------------------------------
+# Load data
+# ------------------------------------------------------------
+baseline = load_kpi_csv(BASELINE_CSV)
+dqn = load_kpi_csv(LIVE_CSV)
+
+# Sidebar health
+with st.sidebar:
+    st.subheader("Data Health")
+    st.write(f"**Baseline rows:** {len(baseline)}")
+    st.write(f"**DQN rows:** {len(dqn)}")
+    if not baseline.empty:
+        st.write(f"Baseline: {baseline['ts'].min().strftime('%H:%M:%S')} → {baseline['ts'].max().strftime('%H:%M:%S')}")
+    if not dqn.empty:
+        st.write(f"DQN: {dqn['ts'].min().strftime('%H:%M:%S')} → {dqn['ts'].max().strftime('%H:%M:%S')}")
+    now = datetime.now(timezone(timedelta(hours=3)))
+    st.caption(f"Updated: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+
+if baseline.empty or dqn.empty:
+    st.warning("Waiting for data… Run baseline and controller first.")
+    st.stop()
+
+# ------------------------------------------------------------
+# Overlap window (with fallback last-N minutes)
+# ------------------------------------------------------------
+minutes_fallback = st.sidebar.slider("Fallback window (minutes)", 1, 10, 2)
+
+overlap_start = max(baseline["ts"].min(), dqn["ts"].min())
+overlap_end   = min(baseline["ts"].max(), dqn["ts"].max())
+has_overlap = overlap_end >= overlap_start
+
+if has_overlap:
+    base_aligned = baseline[(baseline["ts"] >= overlap_start) & (baseline["ts"] <= overlap_end)].copy()
+    dqn_aligned  = dqn[(dqn["ts"] >= overlap_start) & (dqn["ts"] <= overlap_end)].copy()
+    window_msg = f"Window (overlap): **{overlap_start.strftime('%H:%M:%S')} → {overlap_end.strftime('%H:%M:%S')}**"
+else:
+    base_cut = baseline["ts"].max() - pd.Timedelta(minutes=minutes_fallback)
+    dqn_cut  = dqn["ts"].max() - pd.Timedelta(minutes=minutes_fallback)
+    base_aligned = baseline[baseline["ts"] >= base_cut].copy()
+    dqn_aligned  = dqn[dqn["ts"] >= dqn_cut].copy()
+    window_msg = (
+        f"No overlap → comparing each stream’s last **{minutes_fallback} min**  |  "
+        f"**Baseline:** {base_aligned['ts'].min().strftime('%H:%M:%S')} → {base_aligned['ts'].max().strftime('%H:%M:%S')}  |  "
+        f"**DQN:** {dqn_aligned['ts'].min().strftime('%H:%M:%S')} → {dqn_aligned['ts'].max().strftime('%H:%M:%S')}"
+    )
+    st.info("No overlapping time window found — using fallback windows.")
+
+# Warm-up guard
+min_rows = 10
+if len(base_aligned) < min_rows or len(dqn_aligned) < min_rows:
+    st.info(f"Warming up… need ≥ {min_rows} samples in both Baseline and DQN.")
+    st.stop()
+
+# Clip outliers & rolling means
+base_aligned = clip_numeric(base_aligned)
+dqn_aligned  = clip_numeric(dqn_aligned)
+base_r = roll(base_aligned)
+dqn_r  = roll(dqn_aligned)
+
+# ------------------------------------------------------------
+# Metrics
+# ------------------------------------------------------------
+b_speed = safe_mean(base_aligned, "avg_speed")
+b_wait  = safe_mean(base_aligned, "avg_wait")
+b_queue = safe_mean(base_aligned, "avg_queue")
+
+d_speed = safe_mean(dqn_aligned, "avg_speed")
+d_wait  = safe_mean(dqn_aligned, "avg_wait")
+d_queue = safe_mean(dqn_aligned, "avg_queue")
+
+# CO2 proxy (proportional to idle)
+b_co2 = b_wait * 0.35
+d_co2 = d_wait * 0.35
+
+speed_pct = safe_pct(d_speed, b_speed)
+wait_pct  = safe_pct(d_wait,  b_wait)
+queue_pct = safe_pct(d_queue, b_queue)
+co2_pct   = safe_pct(d_co2,   b_co2)
+
+# ------------------------------------------------------------
+# Header
+# ------------------------------------------------------------
+st.title("Adaptive Traffic Control")
+st.caption("Nairobi CBD Lab • SUMO (sim)")
+st.markdown(window_msg)
+
+# ------------------------------------------------------------
+# KPI grid (DQN vs Baseline, side-by-side)
+# ------------------------------------------------------------
+k1, k2, k3, k4 = st.columns(4)
+
+with k1:
+    st.markdown('<div class="kpi">Avg Speed (m/s) — DQN</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi-val">{d_speed:.2f}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi-delta">{speed_pct:+.1f}% vs Baseline</div>', unsafe_allow_html=True)
+    st.markdown('<div class="kpi small">Baseline: {:.2f}</div>'.format(b_speed), unsafe_allow_html=True)
+
+with k2:
+    st.markdown('<div class="kpi">Avg Wait (s/veh) — DQN</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi-val">{d_wait:.1f}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi-delta">{wait_pct:+.1f}% vs Baseline</div>', unsafe_allow_html=True)
+    st.markdown('<div class="kpi small">Baseline: {:.1f}</div>'.format(b_wait), unsafe_allow_html=True)
+
+with k3:
+    st.markdown('<div class="kpi">Avg Queue (veh) — DQN</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi-val">{d_queue:.1f}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi-delta">{queue_pct:+.1f}% vs Baseline</div>', unsafe_allow_html=True)
+    st.markdown('<div class="kpi small">Baseline: {:.1f}</div>'.format(b_queue), unsafe_allow_html=True)
+
+with k4:
+    st.markdown('<div class="kpi">CO₂ est. (g/min) — DQN</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi-val">{d_co2:.1f}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi-delta">{co2_pct:+.1f}% vs Baseline</div>', unsafe_allow_html=True)
+    st.markdown('<div class="kpi small">Baseline: {:.1f}</div>'.format(b_co2), unsafe_allow_html=True)
+
+st.markdown("---")
+
+# ------------------------------------------------------------
+# Tabs: Trends • Distributions • Actions • Data
+# ------------------------------------------------------------
+tab1, tab2, tab3, tab4 = st.tabs(["📈 Trends", "📊 Distributions", "🎛 Actions", "🧾 Data"])
+
+with tab1:
+    c1, c2 = st.columns(2)
+
+    # Speed trend
+    with c1:
+        st.subheader("Average Speed")
+        m_speed = pd.concat([
+            base_r.assign(label="Baseline")[["ts","avg_speed","avg_speed_r","label"]],
+            dqn_r.assign(label="DQN")[["ts","avg_speed","avg_speed_r","label"]],
+        ])
+        fig = go.Figure()
+        for lbl, df_ in m_speed.groupby("label"):
+            fig.add_trace(go.Scatter(x=df_["ts"], y=df_["avg_speed"], mode="lines", name=f"{lbl} (raw)", opacity=0.35))
+            if "avg_speed_r" in df_:
+                fig.add_trace(go.Scatter(x=df_["ts"], y=df_["avg_speed_r"], mode="lines", name=f"{lbl} (roll)",))
+        fig.update_layout(margin=dict(l=10,r=10,t=10,b=10), height=350, legend_title=None)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Wait trend
+    with c2:
+        st.subheader("Average Wait (s/veh)")
+        m_wait = pd.concat([
+            base_r.assign(label="Baseline")[["ts","avg_wait","avg_wait_r","label"]],
+            dqn_r.assign(label="DQN")[["ts","avg_wait","avg_wait_r","label"]],
+        ])
+        fig = go.Figure()
+        for lbl, df_ in m_wait.groupby("label"):
+            fig.add_trace(go.Scatter(x=df_["ts"], y=df_["avg_wait"], mode="lines", name=f"{lbl} (raw)", opacity=0.35))
+            if "avg_wait_r" in df_:
+                fig.add_trace(go.Scatter(x=df_["ts"], y=df_["avg_wait_r"], mode="lines", name=f"{lbl} (roll)"))
+        fig.update_layout(margin=dict(l=10,r=10,t=10,b=10), height=350, legend_title=None)
+        st.plotly_chart(fig, use_container_width=True)
+
+    # Queue trend full width
+    st.subheader("Average Queue (vehicles)")
+    m_queue = pd.concat([
+        base_r.assign(label="Baseline")[["ts","avg_queue","avg_queue_r","label"]],
+        dqn_r.assign(label="DQN")[["ts","avg_queue","avg_queue_r","label"]],
+    ])
+    fig = go.Figure()
+    for lbl, df_ in m_queue.groupby("label"):
+        fig.add_trace(go.Scatter(x=df_["ts"], y=df_["avg_queue"], mode="lines", name=f"{lbl} (raw)", opacity=0.35))
+        if "avg_queue_r" in df_:
+            fig.add_trace(go.Scatter(x=df_["ts"], y=df_["avg_queue_r"], mode="lines", name=f"{lbl} (roll)"))
+    fig.update_layout(margin=dict(l=10,r=10,t=10,b=10), height=300, legend_title=None)
+    st.plotly_chart(fig, use_container_width=True)
+
+with tab2:
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.write("Speed distribution (m/s)")
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(x=base_aligned["avg_speed"], name="Baseline", opacity=0.6, nbinsx=30))
+        fig.add_trace(go.Histogram(x=dqn_aligned["avg_speed"],  name="DQN",      opacity=0.6, nbinsx=30))
+        fig.update_layout(barmode="overlay", margin=dict(l=10,r=10,t=10,b=10), height=280, legend_title=None)
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        st.write("Wait distribution (s/veh)")
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(x=base_aligned["avg_wait"], name="Baseline", opacity=0.6, nbinsx=30))
+        fig.add_trace(go.Histogram(x=dqn_aligned["avg_wait"],  name="DQN",      opacity=0.6, nbinsx=30))
+        fig.update_layout(barmode="overlay", margin=dict(l=10,r=10,t=10,b=10), height=280, legend_title=None)
+        st.plotly_chart(fig, use_container_width=True)
+    with c3:
+        st.write("Queue distribution (veh)")
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(x=base_aligned["avg_queue"], name="Baseline", opacity=0.6, nbinsx=30))
+        fig.add_trace(go.Histogram(x=dqn_aligned["avg_queue"],  name="DQN",      opacity=0.6, nbinsx=30))
+        fig.update_layout(barmode="overlay", margin=dict(l=10,r=10,t=10,b=10), height=280, legend_title=None)
+        st.plotly_chart(fig, use_container_width=True)
+
+with tab3:
+    st.subheader("DQN Action Timeline")
+    # Show action=phase index over time (0/1/etc)
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=dqn_aligned["ts"], y=dqn_aligned["action"], mode="lines+markers",
+                             name="Action", line_shape="hv"))
+    fig.update_yaxes(title_text="Action index", dtick=1)
+    fig.update_layout(margin=dict(l=10,r=10,t=10,b=10), height=260, legend_title=None)
+    st.plotly_chart(fig, use_container_width=True)
+
+with tab4:
+    st.subheader("Filtered Data (current window)")
+    st.write("**Baseline (head)**")
+    st.dataframe(base_aligned.head(20))
+    download_link(base_aligned, "baseline_aligned.csv")
+    st.write("**DQN (head)**")
+    st.dataframe(dqn_aligned.head(20))
+    download_link(dqn_aligned, "dqn_aligned.csv")
+

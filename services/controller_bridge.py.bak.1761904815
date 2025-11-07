@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+controller_bridge.py (v5)
+- Launches SUMO and exposes TraCI on port 8813 (via traci.start(..., port=8813)).
+- Waits for 3 clients total (controller + collector + rl-live).
+- Keeps the sim alive even with 0 vehicles and paces at 1s/step.
+- Reads the latest action from ~/traffic_rl/shared/action.json and applies it.
+- Logs KPIs every second to /home/azureuser/traffic_rl/logs/kpi_live.csv.
+"""
+
+import os, sys, time, json, csv, logging
+
+# -----------------------------------------------------------------------------
+# Ensure SUMO tools are importable BEFORE importing traci (works under systemd)
+# -----------------------------------------------------------------------------
+CANDIDATES = ["/usr/share/sumo", "/usr/local/share/sumo", "/opt/sumo"]
+sumo_home = os.environ.get("SUMO_HOME")
+if not sumo_home:
+    for c in CANDIDATES:
+        if os.path.isdir(c):
+            sumo_home = c
+            break
+if not sumo_home:
+    print("FATAL: Could not locate SUMO_HOME (tried env + common paths).")
+    sys.exit(1)
+
+tools = os.path.join(sumo_home, "tools")
+if tools not in sys.path:
+    sys.path.append(tools)
+
+import traci  # noqa: E402  (import after SUMO tools are on path)
+
+# -----------------------------------------------------------------------------
+# Config
+# -----------------------------------------------------------------------------
+STEP_LENGTH = 1.0                      # seconds per sim step (real-time pacing)
+DECISION_INTERVAL_SECONDS = 10         # align with your TLS phase timing
+TLS_ID = "J0"
+
+SUMO_CMD = [
+    "sumo",
+    "-c", "/home/azureuser/traffic_rl/junctions/uhuru/live.sumocfg",
+    ",              # controller + collector
+    "--step-length", str(STEP_LENGTH),
+    "--no-step-log",
+    "--start", "true",
+    "--quit-on-end", "false"
+]
+# NOTE: do NOT put --remote-port in SUMO_CMD; traci.start(..., port=8813) adds it.
+
+ACTION_PATH = os.path.expanduser("~/traffic_rl/shared/action.json")
+LOG_FILE = "/home/azureuser/traffic_rl/logs/kpi_live.csv"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [controller] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+
+# -----------------------------------------------------------------------------
+# KPI logging
+# -----------------------------------------------------------------------------
+def setup_kpi_log():
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    if not os.path.exists(LOG_FILE) or os.path.getsize(LOG_FILE) == 0:
+        with open(LOG_FILE, "a", newline="") as f:
+            csv.writer(f).writerow(["timestamp", "avg_speed", "avg_wait", "queue_len", "action"])
+
+def log_kpis(action: int):
+    try:
+        # Adjust if your network uses different inbound edge ids
+        edges_in = ["N_in", "S_in", "E_in", "W_in"]
+        total_speed = total_wait = 0.0
+        total_queue = 0
+        valid = 0
+
+        for e in edges_in:
+            total_speed += traci.edge.getLastStepMeanSpeed(e)         # m/s
+            total_wait  += traci.edge.getWaitingTime(e)               # s (sum over vehicles)
+            total_queue += traci.edge.getLastStepHaltingNumber(e)     # vehicles stopped
+            valid += 1
+
+        avg_speed = (total_speed / valid) if valid else 0.0
+        avg_wait  = (total_wait  / valid) if valid else 0.0
+        queue_len = total_queue
+
+        with open(LOG_FILE, "a", newline="") as f:
+            csv.writer(f).writerow([time.time(), avg_speed, avg_wait, queue_len, action])
+    except Exception as e:
+        logging.warning(f"KPI logging failed: {e}")
+
+# -----------------------------------------------------------------------------
+# Action I/O
+# -----------------------------------------------------------------------------
+def get_last_action() -> int:
+    """Read the latest action index written by the policy-service."""
+    try:
+        if os.path.exists(ACTION_PATH):
+            with open(ACTION_PATH, "r") as f:
+                data = json.load(f)
+                return int(data.get("action_index", 0))
+    except Exception:
+        pass
+    return 0
+
+def apply_action(action: int):
+    """Map action -> TLS program head. Tweak indices if your TLS program differs."""
+    try:
+        phase = traci.trafficlight.getPhase(TLS_ID)
+        # Convention: phases 0/1 = EW (green→yellow), 2/3 = NS (green→yellow)
+        if action == 0 and phase in [2, 3]:         # want EW, currently NS
+            traci.trafficlight.setPhaseDuration(TLS_ID, 0.split(",")[0] + ", 0")
+            traci.trafficlight.setPhase(TLS_ID, 0)  # switch to EW head
+        elif action == 1 and phase in [0, 1]:       # want NS, currently EW
+            traci.trafficlight.setPhase(TLS_ID, 2)  # switch to NS head
+    except traci.TraCIException as e:
+        logging.error(f"Failed to apply action: {e}")
+
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+def main():
+    logging.info("Starting SUMO bridge (v5)...")
+    setup_kpi_log()
+
+    # Start SUMO with TraCI on a fixed port (no --remote-port in SUMO_CMD)
+    traci.start(SUMO_CMD, port=8813)
+    logging.info("SUMO launched on port 8813 (num-clients=3).")
+    traci.setOrder(1)
+    logging.info("TraCI client order set to 1 (controller).")
+    step = 0
+    last_action = 0
+    next_wall = time.time()
+    next_decision = time.time() + DECISION_INTERVAL_SECONDS  # for real-time pacing @ STEP_LENGTH seconds
+
+    try:
+        # Keep alive even when no vehicles are expected
+        while True:
+            traci.simulationStep()
+
+            # Apply the latest action every DECISION_INTERVAL_SECONDS
+            if time.time() >= next_decision:
+                last_action = get_last_action()
+                apply_action(last_action)
+                logging.info(f"decision tick: read action={last_action}")
+                next_decision += DECISION_INTERVAL_SECONDS
+
+            # Log KPIs every step (1 Hz)
+            log_kpis(last_action)
+            step += 1
+
+            # Real-time pacing
+            next_wall += STEP_LENGTH
+            delay = next_wall - time.time()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                # if we’re behind, snap to now to avoid drift
+                next_wall = time.time()
+
+    except KeyboardInterrupt:
+        logging.info("Controller stopped manually.")
+    except Exception as e:
+        logging.error(f"Controller error: {e}")
+    finally:
+        try:
+            traci.close(False)
+        except Exception:
+            pass
+        logging.info("SUMO session closed.")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,4 @@
+N_out
+S_out
+E_out
+W_out

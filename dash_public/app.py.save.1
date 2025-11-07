@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+import os
+import time
+import pandas as pd
+from datetime import datetime
+import streamlit as st
+import plotly.express as px
+
+# ---------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------
+LOG_DIR = os.path.expanduser("~/traffic_rl/logs")
+BASELINE_CSV = os.path.join(LOG_DIR, "kpi_baseline.csv")
+RL_CSV = os.path.join(LOG_DIR, "kpi_live.csv")
+
+st.set_page_config(
+    page_title="Traffic Signal Dashboard",
+    page_icon="🚦",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
+
+st.markdown(
+    "<h2 style='text-align:center; color:#111;'>🚦 Traffic Signal Optimization Dashboard</h2>",
+    unsafe_allow_html=True,
+)
+st.caption("Real-time comparison between Fixed-Cycle Baseline and Reinforcement Learning (DQN) Controller")
+
+# ---------------------------------------------------------------------
+# DATA LOADER
+# ---------------------------------------------------------------------
+def load_kpi_csv(path, label, window=5):
+    """Load, clean, and smooth KPI CSV logs."""
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=["ts", "avg_speed", "wait", "queue", "phase", "label", "datetime", "wait_norm"])
+
+    first_line = open(path).readline()
+    skip_header = 1 if "timestamp" in first_line.lower() else 0
+
+    df = pd.read_csv(
+        path,
+        skiprows=skip_header,
+        names=["ts", "avg_speed", "wait", "queue", "phase"],
+        on_bad_lines="skip"
+    )
+
+    df = df[pd.to_numeric(df["ts"], errors="coerce").notna()]
+    df["ts"] = df["ts"].astype(float)
+    df["datetime"] = df["ts"].apply(datetime.fromtimestamp)
+    df["label"] = label
+
+    # --- Sanitize numeric ranges ---
+    df = df[(df["avg_speed"] >= 0) & (df["avg_speed"] <= 15)]
+    df = df[(df["queue"] >= 0) & (df["queue"] <= 500)]
+    df = df[(df["wait"] >= 0) & (df["wait"] <= 5000)]
+
+    # --- Normalized wait (per vehicle) ---
+    df["wait_norm"] = df["wait"] / df["queue"].replace(0, 1)
+
+    # --- Rolling smoothing ---
+    for col in ["avg_speed", "wait", "queue", "wait_norm"]:
+        df[col] = df[col].rolling(window=window, min_periods=1).mean()
+
+    return df
+
+# ---------------------------------------------------------------------
+# LOAD DATA
+# ---------------------------------------------------------------------
+
+combined = pd.concat([baseline, rl], ignore_index=True)
+combined = combined[combined["label"].isin(controllers)]
+combined.sort_values("datetime", inplace=True)
+
+# ---------------------------------------------------------------------
+# KPI CARDS
+# ---------------------------------------------------------------------
+st.markdown("### 📊 Current KPIs")
+
+def latest(df):
+    return df.iloc[-1] if not df.empty else pd.Series({"avg_speed": 0, "queue": 0, "wait": 0, "wait_norm": 0})
+
+b, r = latest(baseline), latest(rl)
+
+cols = st.columns(3)
+cols[0].metric("Baseline Avg Speed", f"{b['avg_speed']:.2f} m/s")
+cols[1].metric("Baseline Queue", f"{int(b['queue'])}")
+cols[2].metric("Baseline Wait (avg)", f"{b['wait_norm']:.1f} s/veh")
+
+cols = st.columns(3)
+cols[0].metric("RL Avg Speed", f"{r['avg_speed']:.2f} m/s")
+cols[1].metric("RL Queue", f"{int(r['queue'])}")
+cols[2].metric("RL Wait (avg)", f"{r['wait_norm']:.1f} s/veh")
+
+st.markdown("---")
+
+# ---------------------------------------------------------------------
+# VISUALIZATION
+# ---------------------------------------------------------------------
+def plot_metric(metric, title, y_label):
+    fig = px.line(
+        combined,
+        x="datetime",
+        y=metric,
+        color="label",
+        labels={"datetime": "Time", metric: y_label, "label": "Controller"},
+        title=title,
+        color_discrete_map={"Baseline": "#f39c12", "RL": "#2ecc71"},
+    )
+    fig.update_layout(
+        template="plotly_white",
+        height=350,
+        font=dict(color="#111", size=13),
+        legend=dict(orientation="h", y=-0.25),
+        margin=dict(l=50, r=30, t=40, b=40),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+plot_metric("avg_speed", "Average Speed Over Time", "Speed (m/s)")
+plot_metric("queue", "Queue Length Over Time", "Vehicles")
+plot_metric("wait_norm", "Average Wait Per Vehicle Over Time", "Seconds / Vehicle")
+
+# ---------------------------------------------------------------------
+# PERFORMANCE SUMMARY
+# ---------------------------------------------------------------------
+if not baseline.empty and not rl.empty:
+    avg_b_speed = baseline["avg_speed"].mean()
+    avg_r_speed = rl["avg_speed"].mean()
+    gain_speed = ((avg_r_speed - avg_b_speed) / avg_b_speed * 100) if avg_b_speed > 0 else 0
+
+    avg_b_queue = baseline["queue"].mean()
+    avg_r_queue = rl["queue"].mean()
+    reduction_queue = ((avg_b_queue - avg_r_queue) / avg_b_queue * 100) if avg_b_queue > 0 else 0
+
+    avg_b_wait = baseline["wait_norm"].mean()
+    avg_r_wait = rl["wait_norm"].mean()
+    reduction_wait = ((avg_b_wait - avg_r_wait) / avg_b_wait * 100) if avg_b_wait > 0 else 0
+
+    st.markdown("### ⚙️ Performance Comparison Summary")
+    st.write(
+        f"**Speed Improvement:** {gain_speed:.2f}% &nbsp;&nbsp;|&nbsp;&nbsp; "
+        f"**Queue Reduction:** {reduction_queue:.2f}% &nbsp;&nbsp;|&nbsp;&nbsp; "
+        f"**Wait Reduction:** {reduction_wait:.2f}%"
+    )
+
+# ---------------------------------------------------------------------
+# AUTO REFRESH
+# ---------------------------------------------------------------------
+st.markdown("---")
+st.caption("🔄 Auto-refreshing every 10 seconds. Press **R** to refresh manually.")
+time.sleep(10)
+st.rerun()

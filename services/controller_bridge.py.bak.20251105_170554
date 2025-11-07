@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Controller Bridge — DQN RL Controller (TraCI client on port 8812)
+- SUMO in 1-client mode
+- Decision cadence every DECISION_INTERVAL_S sim-seconds
+- KPI logging every LOG_INTERVAL seconds (wall clock, aligned grid)
+- ONE_SHOT=1 archives KPI at end of wall-clock episode (copy->reset header)
+- Writes state.json for policy-service (optional)
+"""
+
+import csv
+import json
+import logging
+import os
+import signal
+import sys
+import time
+import shutil
+from pathlib import Path
+
+import traci
+
+# ----------------------------- CONSTANTS -------------------------------------
+TLS_ID              = os.getenv("TLS_ID", "J0")
+STEP_LENGTH         = float(os.getenv("STEP_LENGTH", "1.0"))
+DECISION_INTERVAL_S = float(os.getenv("DECISION_INTERVAL_S", "5.0"))  # sim seconds
+SIM_DURATION        = float(os.getenv("SIM_DURATION", "0"))           # 0=disabled (we use wall clock)
+WALL_DURATION_S     = float(os.getenv("WALL_DURATION_S", "600"))      # 10-min wall clock
+LOG_INTERVAL        = float(os.getenv("LOG_INTERVAL", "5.0"))         # wall seconds
+os.environ["PYTHONUNBUFFERED"] = "1"
+
+ONE_SHOT       = os.getenv("ONE_SHOT", "0") == "1"
+ARCHIVE_PREFIX = os.getenv("ARCHIVE_PREFIX", "rl")
+SUMO_SEED      = os.getenv("SUMO_SEED", "123")
+
+ACTION_FILE = Path("/home/azureuser/traffic_rl/shared/action.json")
+LOG_FILE    = Path("/home/azureuser/traffic_rl/logs/kpi_live.csv")
+STATE_FILE  = Path("/home/azureuser/traffic_rl/shared/state.json")
+LOG_DIR     = LOG_FILE.parent
+
+SUMO_CFG = os.environ.get(
+    "SUMO_CFG",
+    "/home/azureuser/traffic_rl/junctions/uhuru_rl/live.sumocfg",
+)
+
+SUMO_CMD = [
+    "sumo",
+    "-c", SUMO_CFG,
+    "--num-clients", "1",
+    "--step-length", f"{STEP_LENGTH}",
+    "--no-step-log",
+    "--start", "true",
+    "--quit-on-end", "true",
+    "--seed", str(SUMO_SEED),
+]
+
+# ------------------------------ LOGGING --------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [controller] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+RUNNING  = True
+EDGES_IN = []
+
+def _sig_handler(sig, frame):
+    global RUNNING
+    RUNNING = False
+signal.signal(signal.SIGINT,  _sig_handler)
+signal.signal(signal.SIGTERM, _sig_handler)
+
+# ------------------------------ UTIL -----------------------------------------
+def ensure_kpi_header():
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if not LOG_FILE.exists() or LOG_FILE.stat().st_size == 0:
+        with LOG_FILE.open("w", newline="") as f:
+            csv.writer(f).writerow(["timestamp", "avg_speed", "avg_wait", "queue_len", "action"])
+
+def read_action_index(default_action: int = 0) -> int:
+    """Reads {"action_index": <int>} from ACTION_FILE."""
+    try:
+        with ACTION_FILE.open("r") as f:
+            idx = int(json.load(f).get("action_index", default_action))
+        return 1 if idx == 1 else 0
+    except Exception as e:
+        logging.warning(f"could not read action.json, default={default_action}: {e}")
+        return default_action
+
+def discover_inbound_edges(tls_id: str):
+    try:
+        links = traci.trafficlight.getControlledLinks(tls_id)
+        lanes = {l[0][0] for l in links if l and l[0]}
+        edges = sorted({traci.lane.getEdgeID(l) for l in lanes})
+        return edges
+    except Exception as e:
+        logging.error(f"failed to discover inbound edges: {e}")
+        return []
+
+def get_current_phase(tls_id: str) -> int:
+    try:
+        return traci.trafficlight.getPhase(tls_id)
+    except Exception as e:
+        logging.error(f"get_current_phase error: {e}")
+        return 0
+
+def advance_phase(tls_id: str) -> int:
+    try:
+        cur = traci.trafficlight.getPhase(tls_id)
+        defs = traci.trafficlight.getCompleteRedYellowGreenDefinition(tls_id)
+        phases = len(defs[0].phases) if defs and len(defs) > 0 else 2
+        nxt = (cur + 1) % max(1, phases)
+        traci.trafficlight.setPhase(tls_id, nxt)
+        return nxt
+    except Exception as e:
+        logging.error(f"advance_phase error: {e}")
+        return get_current_phase(tls_id)
+
+def apply_action(tls_id: str, action_idx: int) -> int:
+    """0=hold, 1=advance. Returns resulting phase index."""
+    try:
+        if action_idx == 1:
+            return advance_phase(tls_id)
+        return get_current_phase(tls_id)  # HOLD: do not reset timers
+    except Exception as e:
+        logging.error(f"apply_action error: {e}")
+        return get_current_phase(tls_id)
+
+def write_state():
+    """Optional: state for policy-service consumers."""
+    try:
+        state = {
+            "E_queue": float(traci.edge.getLastStepHaltingNumber("E_in")),
+            "E_speed": float(traci.edge.getLastStepMeanSpeed("E_in")),
+            "N_queue": float(traci.edge.getLastStepHaltingNumber("N_in")),
+            "N_speed": float(traci.edge.getLastStepMeanSpeed("N_in")),
+            "S_queue": float(traci.edge.getLastStepHaltingNumber("S_in")),
+            "S_speed": float(traci.edge.getLastStepMeanSpeed("S_in")),
+            "W_queue": float(traci.edge.getLastStepHaltingNumber("W_in")),
+            "W_speed": float(traci.edge.getLastStepMeanSpeed("W_in")),
+            "time_in_phase": float(traci.trafficlight.getNextSwitch(TLS_ID) - traci.simulation.getTime())
+                               if hasattr(traci.trafficlight, "getNextSwitch") else 0.0,
+            "phase_binary": int((traci.trafficlight.getPhase(TLS_ID) // 2) % 2),
+            "schema": "v3",
+        }
+        with STATE_FILE.open("w") as f:
+            json.dump(state, f)
+    except Exception as e:
+        logging.debug(f"write_state skipped: {e}")
+
+def archive_kpi():
+    """Copy live file to archive, then reset live with header so Streamlit never breaks."""
+    try:
+        src = LOG_FILE
+        if src.exists() and src.stat().st_size > 0:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            dst = src.parent / f"kpi_{ARCHIVE_PREFIX}_{stamp}.csv"
+            shutil.copy2(src, dst)
+            with src.open("w", newline="") as f:
+                csv.writer(f).writerow(["timestamp", "avg_speed", "avg_wait", "queue_len", "action"])
+            logging.info(f"Archived KPI → {dst} (live file reset)")
+    except Exception as e:
+        logging.warning(f"Could not archive KPI: {e}")
+
+# ------------------------------- MAIN ----------------------------------------
+def main():
+    logging.info("Starting SUMO bridge (TraCI client on 8812)…")
+    ensure_kpi_header()
+
+    traci.start(SUMO_CMD, port=8812)
+    logging.info("SUMO launched on port 8812 (num-clients=1).")
+
+    # warm-up tick
+    time.sleep(0.5)
+    traci.simulationStep()
+
+    global EDGES_IN
+    EDGES_IN = discover_inbound_edges(TLS_ID)
+    logging.info(f"Inbound edges: {EDGES_IN}")
+
+    # Next decision (SIM time) and last action
+    next_decision = DECISION_INTERVAL_S
+    last_action = 0
+
+    # Wall clock schedule & episode deadline
+    start_wall = time.time()
+    wall_deadline = start_wall + WALL_DURATION_S if WALL_DURATION_S > 0 else None
+    next_log_wall = start_wall + LOG_INTERVAL
+    switch_since_last_log = 0
+
+    try:
+        while RUNNING:
+            traci.simulationStep()
+            simt = traci.simulation.getTime()
+
+            # heartbeat (once per whole second)
+            if abs(simt - round(simt)) < 1e-9:
+                try:
+                    tip = traci.trafficlight.getPhaseElapsed(TLS_ID)
+                except Exception:
+                    tip = 0.0
+                logging.info(f"hb: t={simt:.1f}s, last_action={last_action} tip={tip:.1f}s")
+
+            # ---- Decisions driven by SIMULATION TIME ----
+            if simt >= next_decision:
+                action_idx = read_action_index(default_action=0)
+                before = get_current_phase(TLS_ID)
+                after  = apply_action(TLS_ID, action_idx)
+                last_action = action_idx
+                if action_idx == 1:
+                    switch_since_last_log = 1
+
+                try:
+                    tip = traci.trafficlight.getPhaseElapsed(TLS_ID)
+                except Exception:
+                    tip = 0.0
+                logging.info(
+                    f"decision tick: simt={simt:.1f}s action={action_idx} "
+                    f"before={before} after={after} tip={tip:.1f}s"
+                )
+
+                write_state()
+                next_decision += DECISION_INTERVAL_S
+            # ---------------------------------------------
+
+            # --- KPI logging by WALL-CLOCK with catch-up (aligned with baseline) ---
+            now = time.time()
+            while now >= next_log_wall:
+                try:
+                    total_speed = 0.0
+                    total_wait  = 0.0
+                    total_queue = 0
+                    n = len(EDGES_IN) or 1
+                    for e in EDGES_IN:
+                        total_speed += traci.edge.getLastStepMeanSpeed(e)
+                        total_wait  += traci.edge.getWaitingTime(e)
+                        total_queue += traci.edge.getLastStepHaltingNumber(e)
+                    avg_speed = total_speed / n
+                    avg_wait  = total_wait  / n
+
+                    with LOG_FILE.open("a", newline="") as f:
+                        csv.writer(f).writerow([next_log_wall, avg_speed, avg_wait, total_queue, switch_since_last_log])
+
+                    # clear after writing
+                    switch_since_last_log = 0
+
+                    logging.info(
+                        f"📊 wall={next_log_wall:.0f} | simt={simt:.1f} | "
+                        f"AvgSpeed={avg_speed:.2f} | Wait={avg_wait:.1f}s | "
+                        f"Queue={total_queue} | action={last_action}"
+                    )
+                except Exception as e:
+                    logging.debug(f"KPI fetch skipped: {e}")
+
+                next_log_wall += LOG_INTERVAL
+            # ----------------------------------------------------------------------
+
+            # End by wall-clock first (if set)
+            if wall_deadline and time.time() >= wall_deadline:
+                logging.info(f"Reached WALL_DURATION_S={WALL_DURATION_S:.0f}s — ending RL episode.")
+                traci.close(False)
+                return 0
+
+            # Optional sim cap (if you also set SIM_DURATION > 0)
+            if SIM_DURATION > 0 and simt >= SIM_DURATION:
+                logging.info(f"Reached SIM_DURATION={SIM_DURATION:.1f}s — ending RL episode.")
+                traci.close(False)
+                return 0
+
+            # Small cooperative sleep
+            time.sleep(0.005)
+
+    finally:
+        try:
+            traci.close(False)
+            logging.info("SUMO closed.")
+        except Exception:
+            pass
+
+    return 0
+
+# ------------------------------------------------------------------------------
+// ENTRYPOINT
+# ------------------------------------------------------------------------------  # (comment above is just a separator)
+if __name__ == "__main__":
+    if ONE_SHOT:
+        rc = main()
+        archive_kpi()
+        sys.exit(rc)
+    else:
+        # Legacy looping mode: run forever, archive each episode
+        while True:
+            try:
+                rc = main()
+                archive_kpi()
+                logging.info("Episode finished — restarting in 10 min.")
+                time.sleep(600)
+            except Exception as e:
+                logging.error(f"[controller] crashed: {e}", exc_info=True)
+                time.sleep(5)

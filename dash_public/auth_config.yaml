@@ -1,0 +1,22 @@
+credentials:
+  usernames:
+    admin:
+      email: admin@trafficrl.local
+      name: System Admin
+      password: $2b$12$BKuRCkEd5/9dL2DeOjTf4eIVYazv6iAKBDZQvVkuA6iTuCzqpEVsK  # hash for 'admin123'
+      role: admin
+    viewer:
+      email: viewer@trafficrl.local
+      name: Dashboard Viewer
+      password: $2b$12$5ZsLVcbrIhVS7wNm6ITVTekGdAXeuvWBAhZS7.hN5qesTu8mUYBra  # hash for 'traffic123'
+      role: viewer
+
+cookie:
+  expiry_days: 1
+  key: "trafficrl_secret_cookie"
+  name: "trafficrl_dashboard_cookie"
+
+preauthorized:
+  emails:
+    - admin@trafficrl.local
+    - viewer@trafficrl.local

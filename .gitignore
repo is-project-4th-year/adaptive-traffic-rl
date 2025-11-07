@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.bak
+
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Logs & output
+logs/
+*.log
+*.csv
+*.json
+*.out
+*.err
+
+# Models & data
+models/*.h5
+models/*.weights.h5
+shared/
+*.npy
+*.npz
+
+# System files
+.DS_Store
+*.swp
+.idea/
+.vscode/
+junctions/uhuru_baseline/uhuru/*.xml
+junctions/uhuru_rl/*.xml
+
+junctions/**/uhuru/det_*_queue.xml
+junctions/**/uhuru/sed*
+junctions/**/uhuru_both/uhuru/*
+junctions/**/uhuru_baseline/uhuru/*
+*.xml~
+

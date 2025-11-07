@@ -1,0 +1,6 @@
+<edges>
+   <edge id="N_out" weight="1.0"/>
+   <edge id="S_out" weight="1.0"/>
+   <edge id="E_out" weight="1.0"/>
+   <edge id="W_out" weight="1.0"/>
+</edges>

@@ -1,0 +1,12 @@
+<configuration>
+  <input>
+    <net-file value="cross.net.xml"/>
+    <route-files value="stress.rou.xml"/>
+    <additional-files value="detectors.add.xml,flows.add.xml"/>
+    <tripinfo-output value="baseline_trips.xml"/>
+  </input>
+  <time>
+    <begin value="0"/>
+    <end value="7200"/>
+  </time>
+</configuration>

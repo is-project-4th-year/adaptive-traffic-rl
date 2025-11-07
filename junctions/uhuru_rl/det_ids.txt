@@ -1,0 +1,4 @@
+det_N_in
+det_S_in
+det_E_in
+det_W_in

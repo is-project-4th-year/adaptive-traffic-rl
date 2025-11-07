@@ -1,0 +1,12 @@
+<additional>
+    <inductionLoop id="det_N_in" lane="N_in_0" pos="50" freq="60" file="det_N_in.xml"/>
+    <inductionLoop id="det_S_in" lane="S_in_0" pos="50" freq="60" file="det_S_in.xml"/>
+    <inductionLoop id="det_E_in" lane="E_in_0" pos="50" freq="60" file="det_E_in.xml"/>
+    <inductionLoop id="det_W_in" lane="W_in_0" pos="50" freq="60" file="det_W_in.xml"/>
+
+    <inductionLoop id="det_N_queue" lane="N_in_0" pos="5" freq="1" file="det_N_queue.xml"/>
+    <inductionLoop id="det_S_queue" lane="S_in_0" pos="5" freq="1" file="det_S_queue.xml"/>
+    <inductionLoop id="det_E_queue" lane="E_in_0" pos="5" freq="1" file="det_E_queue.xml"/>
+    <inductionLoop id="det_W_queue" lane="W_in_0" pos="5" freq="1" file="det_W_queue.xml"/>
+
+    </additional>
