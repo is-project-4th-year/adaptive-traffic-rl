@@ -61,3 +61,70 @@ The dashboard uses `streamlit-authenticator` with YAML-based credentials (`auth_
 These are logged automatically to `~/traffic_rl/logs/` and aggregated into `paired_summary.csv`.
 
 ---
+
+##🚦 Adaptive Traffic RL — Setup & Deployment
+
+1) Clone the repo
+
+
+git clone https://github.com/is-project-4th-year/adaptive-traffic-rl.git
+cd adaptive-traffic-rl
+
+2) Create virtual environment
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+
+3) Environment variables
+
+export SUMO_HOME=/usr/share/sumo
+export PYTHONPATH=/usr/share/sumo/tools
+export GOOGLE_MAPS_API_KEY="your_api_key"
+
+
+Tip: put these in ~/.bashrc or a .env and source it.
+
+4) Start services (systemd)
+
+sudo systemctl start policy-service
+sudo systemctl start controller_rl
+sudo systemctl start controller_baseline
+sudo systemctl start rl-day-runner
+
+
+Check status:
+
+systemctl --no-pager --type=service | grep -E "policy|controller|runner"
+
+
+5) Launch the dashboard
+
+streamlit run dash_public/app.py --server.port 8501 --server.address 0.0.0.0
+
+
+Open: http://<vm-public-ip>:8501
+
+📁 Project layout
+
+traffic_rl/
+├─ dash_public/      # Streamlit dashboard (+ auth_config.yaml)
+├─ services/         # Controllers, policy service, sensors
+├─ scripts/          # Paired rollup, day runner, helpers
+├─ junctions/        # SUMO networks & routes
+├─ logs/             # KPI + paired summaries (runtime)
+└─ models/           # Trained DQN models
+
+
+🔒 Security
+
+Keep API keys and credentials out of git (.gitignore already covers auth_config.yaml, logs, models).
+
+Don’t commit massive SUMO detector outputs or CSV logs.
+
+👥 Contributors
+
+Jeremy Wanjohi — System design, RL integration, dashboard
+
+
