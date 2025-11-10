@@ -22,14 +22,14 @@ All performance metrics (speed, wait time, queue length, and actions) are logged
 
 **Components**
 
-| Service                      | Description                                   | Path                                                                  |
-| ---------------------------- | --------------------------------------------- | --------------------------------------------------------------------- |
-| gmaps-sensor.service         | Polls Google Routes API for live travel times | \~/traffic\_rl/services/                                              |
-| policy-service.service       | TensorFlow/Keras API returning RL actions     | \~/traffic\_rl/services/policy\_[service.py](http://service.py)       |
-| controller\_baseline.service | SUMO fixed-cycle baseline                     | \~/traffic\_rl/services/controller\_[baseline.py](http://baseline.py) |
-| controller\_rl.service       | Reinforcement Learning controller (DQN)       | \~/traffic\_rl/services/controller\_[bridge.py](http://bridge.py)     |
-| rl-day-runner.service        | Automates daily paired runs (baseline + RL)   | \~/traffic\_rl/scripts/day\_[runner.py](http://runner.py)             |
-| dashboard                    | Streamlit app for visualization               | \~/traffic\_rl/dash\_public/[app.py](http://app.py)                   |
+| Service                      | Description                                   |                                                                   
+| ---------------------------- | --------------------------------------------- | 
+| gmaps-sensor.service         | Polls Google Routes API for live travel times |                                              
+| policy-service.service       | TensorFlow/Keras API returning RL actions     |
+| controller\_baseline.service | SUMO fixed-cycle baseline                     | 
+| controller\_rl.service       | Reinforcement Learning controller (DQN)       | 
+| rl-day-runner.service        | Automates daily paired runs (baseline + RL)   | 
+| dashboard                    | Streamlit app for visualization               |
 
 ---
 
@@ -142,3 +142,4 @@ traffic_rl/
 
 * Jeremy Wanjohi — System design, RL integration, dashboard  
 ##
+
