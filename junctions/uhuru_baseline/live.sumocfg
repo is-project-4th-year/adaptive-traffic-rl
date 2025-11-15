@@ -1,13 +1,13 @@
 <configuration>
     <input>
         <net-file value="cross.net.xml"/>
-        <route-files value="typical.rou.xml"/>
+        <route-files value="dynamic_flows.rou.xml"/>
         <additional-files value="detectors.add.xml"/>
     </input>
 
     <time>
         <begin value="0"/>
-        <end value="3600"/>
+        <end value="900"/>
         <step-length value="1.0"/>
     </time>
 

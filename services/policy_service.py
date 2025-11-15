@@ -24,8 +24,7 @@ from tensorflow.keras.layers import Dense, Input
 
 STATE_FILE = Path("/home/azureuser/traffic_rl/shared/state.json")
 ACTION_FILE = Path("/home/azureuser/traffic_rl/shared/action.json")
-MODEL_PATH = Path("/home/azureuser/traffic_rl/models/dqn_model_v3_best.weights.h5")
-
+MODEL_PATH = Path("/home/azureuser/traffic_rl/models/dqn_model_v4_best.weights.h5")
 POLL_INTERVAL = 3.0     # seconds between polls of state.json
 INPUT_DIM = 10           # number of features in state.json
 OUTPUT_DIM = 2           # number of discrete actions (hold/advance)
@@ -45,11 +44,11 @@ logging.basicConfig(
 # ---------------------------------------------------------------------------
 
 def build_dqn(input_dim=INPUT_DIM, output_dim=OUTPUT_DIM):
-    """Define the same architecture used during training."""
+    """Define the SAME architecture as training (v4 = 128-128-2)."""
     model = Sequential([
         Input(shape=(input_dim,)),
-        Dense(64, activation='relu'),
-        Dense(64, activation='relu'),
+        Dense(128, activation='relu'),
+        Dense(128, activation='relu'),
         Dense(output_dim, activation='linear')
     ])
     return model
@@ -71,30 +70,35 @@ def load_dqn():
 # ---------------------------------------------------------------------------
 
 def read_state():
-    """Reads the latest state.json file and returns feature vector."""
+    """Reads state.json and returns the v4 10-element raw state vector."""
     try:
-        with STATE_FILE.open("r") as f:
-            data = json.load(f)
+        data = json.loads(STATE_FILE.read_text())
 
-        # Maintain the same feature order used during training
-        features = np.array([
-            data.get("E_queue", 0),
-            data.get("E_speed", 0),
-            data.get("N_queue", 0),
-            data.get("N_speed", 0),
-            data.get("S_queue", 0),
-            data.get("S_speed", 0),
-            data.get("W_queue", 0),
-            data.get("W_speed", 0),
-            data.get("phase_binary", 0),
-            data.get("time_in_phase", 0)
-        ], dtype=float)
+        # Phase normalization (v4 uses 0=NS,1=EW same as training)
+        phase_raw = float(data.get("phase_binary", 0.0))
+        if phase_raw in (2.0, 3.0):
+            phase_binary = 0.0
+        else:
+            phase_binary = 1.0
 
-        return features
+        raw = np.array([
+            phase_binary,                      # 0
+            float(data.get("time_in_phase", 0)),
+            float(data.get("N_queue", 0)),     # 2
+            float(data.get("S_queue", 0)),     # 3
+            float(data.get("E_queue", 0)),     # 4
+            float(data.get("W_queue", 0)),     # 5
+            float(data.get("N_speed", 0)),     # 6
+            float(data.get("S_speed", 0)),     # 7
+            float(data.get("E_speed", 0)),     # 8
+            float(data.get("W_speed", 0)),     # 9
+        ], dtype=np.float32)
+
+        return raw
+
     except Exception as e:
-        logging.warning(f"⚠️ Could not read state.json: {e}")
+        logging.warning(f"⚠️ Bad state.json: {e}")
         return None
-
 
 def decide_action(model, state_vec):
     """Runs the model to choose the best action."""
@@ -134,9 +138,8 @@ def main():
         state_vec = read_state()
         if state_vec is not None:
             action_idx, q_values = decide_action(model, state_vec)
-            if action_idx != last_action:
-                write_action(action_idx, q_values)
-                last_action = action_idx
+        write_action(action_idx, q_values)
+        last_action = action_idx
         time.sleep(POLL_INTERVAL)
 
 

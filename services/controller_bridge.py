@@ -1,307 +1,377 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Controller Bridge — DQN RL Controller (TraCI client on port 8812)
-- SUMO in 1-client mode
-- Decision cadence every DECISION_INTERVAL_S sim-seconds
-- KPI logging every LOG_INTERVAL seconds (WALL-CLOCK, aligned grid)
-- ONE_SHOT=1 archives KPI at end of wall-clock episode (copy->reset header)
-- Writes state.json for policy-service (optional)
+RL Controller — STRICT 600s Paired Episode Mode (v4 state)
+----------------------------------------------------------
+- Reads pair_sync.json
+- Waits until start_at_epoch
+- Runs SUMO at full speed (no sleeping)
+- Writes v4 10-dim state to state.json (atomic)
+- Reads action.json from policy-service
+- KPI logging EXACTLY every STEP_S seconds (wall-clock)
+- EXACT SAME tick count as baseline
 """
 
-import csv
-import json
-import logging
 import os
-import signal
 import sys
 import time
-import shutil
+import json
+import csv
+import logging
+import signal
 from pathlib import Path
 
 import traci
 
-# ----------------------------- CONSTANTS -------------------------------------
-TLS_ID              = os.getenv("TLS_ID", "J0")
-STEP_LENGTH         = float(os.getenv("STEP_LENGTH", "1.0"))
-DECISION_INTERVAL_S = float(os.getenv("DECISION_INTERVAL_S", "5.0"))  # sim seconds
-SIM_DURATION        = float(os.getenv("SIM_DURATION", "0"))           # 0=disabled (we use wall clock)
-WALL_DURATION_S     = float(os.getenv("WALL_DURATION_S", "600"))      # 10-min wall clock
-LOG_INTERVAL        = float(os.getenv("LOG_INTERVAL", "5.0"))         # wall seconds
-os.environ["PYTHONUNBUFFERED"] = "1"
-
-ONE_SHOT       = os.getenv("ONE_SHOT", "0") == "1"
-ARCHIVE_PREFIX = os.getenv("ARCHIVE_PREFIX", "rl")
-SUMO_SEED      = os.getenv("SUMO_SEED", "123")
-
-ACTION_FILE = Path("/home/azureuser/traffic_rl/shared/action.json")
-LOG_FILE    = Path("/home/azureuser/traffic_rl/logs/kpi_live.csv")
-STATE_FILE  = Path("/home/azureuser/traffic_rl/shared/state.json")
-LOG_DIR     = LOG_FILE.parent
-
-SUMO_CFG = os.environ.get(
-    "SUMO_CFG",
-    "/home/azureuser/traffic_rl/junctions/uhuru_rl/live.sumocfg",
-)
-
-SUMO_CMD = [
-    "sumo",
-    "-c", SUMO_CFG,
-    "--num-clients", "1",
-    "--step-length", f"{STEP_LENGTH}",
-    "--no-step-log",
-    "--start", "true",
-    "--quit-on-end", "true",
-    "--seed", str(SUMO_SEED),
-]
-
-# ------------------------------ LOGGING --------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [controller] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+    format="%(asctime)s [rl] %(message)s"
 )
 
-RUNNING  = True
-EDGES_IN = []
+# ------------------------------------------------------------
+# PATHS
+# ------------------------------------------------------------
+SYNC_PATH = "/home/azureuser/traffic_rl/shared/pair_sync.json"
+ACTION_FILE = Path("/home/azureuser/traffic_rl/shared/action.json")
+STATE_FILE  = Path("/home/azureuser/traffic_rl/shared/state.json")
 
-def _sig_handler(sig, frame):
+LOG_FILE = Path("/home/azureuser/traffic_rl/logs/kpi_live.csv")
+LOG_DIR  = LOG_FILE.parent
+
+TLS_ID = "J0"
+STEP_LENGTH = 1.0     # SIM TIME step
+DEMAND_SCALE = os.environ.get("DEMAND_SCALE", "")
+RUNNING = True
+
+NEXT_TICK = None      # function(k)->wall_epoch
+STEP_S    = 5         # KPI interval
+K         = 0         # tick counter
+
+# v4 detector IDs (match training script)
+FLOW_DETECTORS  = ["det_N_in", "det_S_in", "det_E_in", "det_W_in"]
+QUEUE_DETECTORS = ["det_N_queue", "det_S_queue", "det_E_queue", "det_W_queue"]
+
+
+# ------------------------------------------------------------
+# SIGNAL HANDLER
+# ------------------------------------------------------------
+def handler(sig, frame):
     global RUNNING
     RUNNING = False
-signal.signal(signal.SIGINT,  _sig_handler)
-signal.signal(signal.SIGTERM, _sig_handler)
 
-# ------------------------------ UTIL -----------------------------------------
+signal.signal(signal.SIGINT, handler)
+signal.signal(signal.SIGTERM, handler)
+
+
+# ------------------------------------------------------------
+# SYNC SETUP
+# ------------------------------------------------------------
+def sync_setup():
+    global NEXT_TICK, STEP_S
+
+    if not os.path.exists(SYNC_PATH):
+        raise RuntimeError("pair_sync.json missing — cannot run paired episode")
+
+    with open(SYNC_PATH) as f:
+        sync = json.load(f)
+
+    start_at = float(sync["start_at_epoch"])
+    STEP_S   = int(sync["step_seconds"])
+
+    # Hard wait until synced start
+    while True:
+        dt = start_at - time.time()
+        if dt <= 0.02:
+            break
+        time.sleep(min(dt, 0.05))
+
+    def _tick(k):
+        return start_at + k * STEP_S
+
+    NEXT_TICK = _tick
+    logging.info(f"[rl-sync] start={start_at}, step={STEP_S}")
+
+    return start_at
+
+
+# ------------------------------------------------------------
+# HEADER ENSURE
+# ------------------------------------------------------------
 def ensure_kpi_header():
-    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if not LOG_FILE.exists() or LOG_FILE.stat().st_size == 0:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if not LOG_FILE.exists() or LOG_FILE.stat().st_size < 20:
         with LOG_FILE.open("w", newline="") as f:
-            csv.writer(f).writerow(["timestamp", "avg_speed", "avg_wait", "queue_len", "action"])
+            csv.writer(f).writerow(
+                ["timestamp", "avg_speed", "avg_wait", "queue_len", "action"]
+            )
 
-def read_action_index(default_action: int = 0) -> int:
-    """Reads {"action_index": <int>} from ACTION_FILE. Normalizes to 0/1."""
+
+# ------------------------------------------------------------
+# ACTION READ
+# ------------------------------------------------------------
+def read_action():
+    """Read action_index from action.json (default 0 on any error)."""
     try:
-        with ACTION_FILE.open("r") as f:
-            idx = int(json.load(f).get("action_index", default_action))
+        with ACTION_FILE.open() as f:
+            idx = int(json.load(f).get("action_index", 0))
         return 1 if idx == 1 else 0
     except Exception as e:
-        logging.warning(f"could not read action.json, default={default_action}: {e}")
-        return default_action
-
-def discover_inbound_edges(tls_id: str):
-    try:
-        links = traci.trafficlight.getControlledLinks(tls_id)
-        lanes = {l[0][0] for l in links if l and l[0]}
-        edges = sorted({traci.lane.getEdgeID(l) for l in lanes})
-        return edges
-    except Exception as e:
-        logging.error(f"failed to discover inbound edges: {e}")
-        return []
-
-def get_current_phase(tls_id: str) -> int:
-    try:
-        return traci.trafficlight.getPhase(tls_id)
-    except Exception as e:
-        logging.error(f"get_current_phase error: {e}")
+        logging.warning(f"[rl] could not read action.json, defaulting to 0: {e}")
         return 0
 
-def advance_phase(tls_id: str) -> int:
-    try:
-        cur = traci.trafficlight.getPhase(tls_id)
-        defs = traci.trafficlight.getCompleteRedYellowGreenDefinition(tls_id)
-        phases = len(defs[0].phases) if defs and len(defs) > 0 else 2
-        nxt = (cur + 1) % max(1, phases)
-        traci.trafficlight.setPhase(tls_id, nxt)
-        return nxt
-    except Exception as e:
-        logging.error(f"advance_phase error: {e}")
-        return get_current_phase(tls_id)
 
-def apply_action(tls_id: str, action_idx: int) -> int:
-    """0=hold, 1=advance. Returns resulting phase index."""
+# ------------------------------------------------------------
+# EDGE DISCOVERY (for KPI only)
+# ------------------------------------------------------------
+def discover_edges():
     try:
-        if action_idx == 1:
-            return advance_phase(tls_id)
-        return get_current_phase(tls_id)  # HOLD: do not reset timers
+        links = traci.trafficlight.getControlledLinks(TLS_ID)
+        lanes = {l[0][0] for l in links if l and l[0]}
+        return sorted({traci.lane.getEdgeID(l) for l in lanes})
     except Exception as e:
-        logging.error(f"apply_action error: {e}")
-        return get_current_phase(tls_id)
+        logging.warning(f"[rl] discover_edges failed: {e}")
+        return []
 
-def write_state():
-    """Optional: state for policy-service consumers."""
+
+# ------------------------------------------------------------
+# v4 STATE BUILD + WRITE
+# ------------------------------------------------------------
+# ------------------------------------------------------------
+# v4 STATE BUILD + WRITE (fixed, clean, no syntax issues)
+# ------------------------------------------------------------
+def build_state_v4():
+    """
+    Build v4 10-dim state:
+
+    [phase_binary, time_in_phase,
+     N_queue, S_queue, E_queue, W_queue,
+     N_speed, S_speed, E_speed, W_speed]
+    """
+
     try:
-        state = {
-            "E_queue": float(traci.edge.getLastStepHaltingNumber("E_in")),
-            "E_speed": float(traci.edge.getLastStepMeanSpeed("E_in")),
-            "N_queue": float(traci.edge.getLastStepHaltingNumber("N_in")),
-            "N_speed": float(traci.edge.getLastStepMeanSpeed("N_in")),
-            "S_queue": float(traci.edge.getLastStepHaltingNumber("S_in")),
-            "S_speed": float(traci.edge.getLastStepMeanSpeed("S_in")),
-            "W_queue": float(traci.edge.getLastStepHaltingNumber("W_in")),
-            "W_speed": float(traci.edge.getLastStepMeanSpeed("W_in")),
-            "time_in_phase": float(
-                traci.trafficlight.getNextSwitch(TLS_ID) - traci.simulation.getTime()
-            ) if hasattr(traci.trafficlight, "getNextSwitch") else 0.0,
-            "phase_binary": int(traci.trafficlight.getPhase(TLS_ID)),
-            "schema": "v3",
+        # Phase: 1 = EW green, 0 = NS green
+        phase_idx = traci.trafficlight.getPhase(TLS_ID)
+        phase_binary = 1.0 if phase_idx in [0, 1] else 0.0
+
+        # Time in current phase
+        t_now = traci.simulation.getTime()
+        next_switch = traci.trafficlight.getNextSwitch(TLS_ID)
+        duration = traci.trafficlight.getPhaseDuration(TLS_ID)
+        time_in_phase = max(0.0, duration - (next_switch - t_now))
+
+        # Queues
+        qN = float(traci.inductionloop.getLastStepVehicleNumber("det_N_queue"))
+        qS = float(traci.inductionloop.getLastStepVehicleNumber("det_S_queue"))
+        qE = float(traci.inductionloop.getLastStepVehicleNumber("det_E_queue"))
+        qW = float(traci.inductionloop.getLastStepVehicleNumber("det_W_queue"))
+
+        # Speeds
+        vN = max(0.0, float(traci.inductionloop.getLastStepMeanSpeed("det_N_in")))
+        vS = max(0.0, float(traci.inductionloop.getLastStepMeanSpeed("det_S_in")))
+        vE = max(0.0, float(traci.inductionloop.getLastStepMeanSpeed("det_E_in")))
+        vW = max(0.0, float(traci.inductionloop.getLastStepMeanSpeed("det_W_in")))
+
+        return {
+            "schema": "v4",
+            "phase_binary": phase_binary,
+            "time_in_phase": time_in_phase,
+            "N_queue": qN,
+            "S_queue": qS,
+            "E_queue": qE,
+            "W_queue": qW,
+            "N_speed": vN,
+            "S_speed": vS,
+            "E_speed": vE,
+            "W_speed": vW,
+            "timestamp": time.time(),
         }
-        with STATE_FILE.open("w") as f:
-            json.dump(state, f)
-    except Exception as e:
-        logging.debug(f"write_state skipped: {e}")
 
-def archive_kpi():
+    except Exception as e:
+        logging.warning(f"[rl] build_state_v4 failed: {e}")
+
+        return {
+            "schema": "v4",
+            "phase_binary": 0.0,
+            "time_in_phase": 0.0,
+            "N_queue": 0.0,
+            "S_queue": 0.0,
+            "E_queue": 0.0,
+            "W_queue": 0.0,
+            "N_speed": 0.0,
+            "S_speed": 0.0,
+            "E_speed": 0.0,
+            "W_speed": 0.0,
+            "timestamp": time.time(),
+        }
+
+
+def write_state_atomic(payload: dict):
+    """Atomic write of state.json to avoid truncated/bad JSON."""
     try:
-        src = LOG_FILE
-        if src.exists() and src.stat().st_size > 0:
-            stamp = time.strftime("%Y%m%d_%H%M%S")
-            dst = src.parent / f"kpi_{ARCHIVE_PREFIX}_{stamp}.csv"
-            shutil.copy2(src, dst)  # archive copy
-            with src.open("w", newline="") as f:
-                csv.writer(f).writerow(
-                    ["timestamp", "avg_speed", "avg_wait", "queue_len", "action"]
-                )
-            logging.info(f"Archived KPI → {dst} (live file reset)")
+        tmp = STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload))
+        tmp.replace(STATE_FILE)
     except Exception as e:
-        logging.warning(f"Could not archive KPI: {e}")
+        logging.warning(f"[rl] failed to write state.json atomically: {e}")
 
-def _align_next(now: float, interval: float) -> float:
-    """Return the next epoch second aligned to the given interval (e.g., 0,5,10,15...)."""
-    return (int(now // interval) + 1) * interval
 
-# ------------------------------- MAIN ----------------------------------------
+# ------------------------------------------------------------
+# APPLY ACTION (still simple: 0=hold, 1=advance)
+# ------------------------------------------------------------
+MIN_GREEN = 8.0   # seconds
+
+def apply_action(idx):
+    try:
+        # get time in phase
+        t_now = traci.simulation.getTime()
+        next_switch = traci.trafficlight.getNextSwitch(TLS_ID)
+        duration = traci.trafficlight.getPhaseDuration(TLS_ID)
+        time_in_phase = max(0.0, duration - (next_switch - t_now))
+
+        # prevent switch spam
+        if time_in_phase < MIN_GREEN:
+            return 0  # force hold
+
+        if idx == 1:
+            cur = traci.trafficlight.getPhase(TLS_ID)
+            defs = traci.trafficlight.getCompleteRedYellowGreenDefinition(TLS_ID)
+            phases = len(defs[0].phases)
+            nxt = (cur + 1) % phases
+            traci.trafficlight.setPhase(TLS_ID, nxt)
+            return 1
+
+        return 0
+    except Exception:
+        return 0
+
+# ------------------------------------------------------------
+# MAIN LOOP (STRICT 600s, v4 state writer)
+# ------------------------------------------------------------
+# ------------------------------------------------------------
 def main():
-    logging.info("Starting SUMO bridge (TraCI client on 8812)…")
+    global K
+
+    logging.info("🔥 RL Controller (strict 600s mode, v4 state) starting…")
     ensure_kpi_header()
 
-    traci.start(SUMO_CMD, port=8812)
-    logging.info("SUMO launched on port 8812 (num-clients=1).")
+    # Sync with baseline (defines NEXT_TICK + STEP_S)
+    start_at = sync_setup()
 
-    # warm-up tick
-    time.sleep(0.5)
+    # Launch SUMO
+    SUMO_CFG = "/home/azureuser/traffic_rl/junctions/uhuru_rl/live.sumocfg"
+    sumo_cmd = [
+        "sumo",
+        "-c", SUMO_CFG,
+        "--num-clients", "1",
+        "--step-length", f"{STEP_LENGTH}",
+        "--start", "true",
+        "--quit-on-end", "true",
+        "--no-step-log",
+    ]
+
+    # Optional demand scaler (0.1–1.0)
+    if DEMAND_SCALE:
+        sumo_cmd += ["--scale", str(DEMAND_SCALE)]
+
+    traci.start(sumo_cmd, port=8812)
+
+    # Initial step so detectors/TLS state are valid
+    time.sleep(0.3)
     traci.simulationStep()
 
-    global EDGES_IN
-    EDGES_IN = discover_inbound_edges(TLS_ID)
-    logging.info(f"Inbound edges: {EDGES_IN}")
+    edges = discover_edges()
+    logging.info(f"[rl] inbound={edges}")
 
-    # Next decision (SIM time) and last action
-    next_decision = DECISION_INTERVAL_S
-    last_action = 0
+    # strict fixed tick count
+    EPISODE_LEN_S = 600  # must match baseline/day_runner
+    n_steps = EPISODE_LEN_S // STEP_S
+    steps_per_tick = max(1, int(round(STEP_S / STEP_LENGTH)))
+    K = 0
 
-    # Wall clock schedule & episode deadline
-    start_wall = time.time()
-    wall_deadline = start_wall + WALL_DURATION_S if WALL_DURATION_S > 0 else None
-    next_log_wall = _align_next(time.time(), LOG_INTERVAL)  # << aligned grid
-    switch_since_last_log = 0
+    logging.info(
+        f"[rl] Running {n_steps} ticks @ {STEP_S}s "
+        f"({steps_per_tick} sim-steps per tick, step_length={STEP_LENGTH})"
+    )
 
+    # ------- MAIN LOOP (FAST SUMO, KPI + STATE PER TICK) -------
     try:
-        while RUNNING:
-            traci.simulationStep()
-            simt = traci.simulation.getTime()
+        for K in range(n_steps):
+            if not RUNNING:
+                break
 
-            # heartbeat (once per whole second)
-            if abs(simt - round(simt)) < 1e-9:
-                try:
-                    tip = traci.trafficlight.getPhaseElapsed(TLS_ID)
-                except Exception:
-                    tip = 0.0
-                logging.info(f"hb: t={simt:.1f}s, last_action={last_action} tip={tip:.1f}s")
+            # 🕒 Wait until this tick's wall-clock time (real 5s cadence)
+            target_ts = NEXT_TICK(K)
+            while True:
+                now = time.time()
+                dt = target_ts - now
+                if dt <= 0:
+                    break
+                time.sleep(min(0.05, dt))
 
-            # ---- Decisions driven by SIMULATION TIME ----
-            if simt >= next_decision:
-                action_idx = read_action_index(default_action=0)
-                before = get_current_phase(TLS_ID)
-                after  = apply_action(TLS_ID, action_idx)
-                last_action = action_idx
-                if action_idx == 1:
-                    switch_since_last_log = 1
+            # Advance SUMO by STEP_S sim seconds
+            for _ in range(steps_per_tick):
+                traci.simulationStep()
 
-                try:
-                    tip = traci.trafficlight.getPhaseElapsed(TLS_ID)
-                except Exception:
-                    tip = 0.0
-                logging.info(
-                    f"decision tick: simt={simt:.1f}s action={action_idx} "
-                    f"before={before} after={after} tip={tip:.1f}s"
+            sim_t    = traci.simulation.getTime()
+            veh_left = traci.simulation.getMinExpectedNumber()
+            # Optional debug:
+            # print(f"[rl-debug] tick={K} sim_t={sim_t} veh_left={veh_left}")
+
+            # 1) Build + write v4 state for policy-service
+            state_payload = build_state_v4()
+            write_state_atomic(state_payload)
+
+            # 2) Read action decided by policy-service
+            action   = read_action()
+            switched = apply_action(action)
+
+            # 3) KPIs (edge-level)
+            total_speed = 0.0
+            total_wait  = 0.0
+            total_queue = 0.0
+            n_edges = len(edges) or 1
+
+            for e in edges:
+                total_speed += traci.edge.getLastStepMeanSpeed(e)
+                total_wait  += traci.edge.getWaitingTime(e)
+                total_queue += traci.edge.getLastStepHaltingNumber(e)
+
+            avg_speed = total_speed / n_edges
+            avg_wait  = total_wait  / n_edges
+
+            # Wall-clock timestamp aligned with baseline via NEXT_TICK
+            ts = NEXT_TICK(K)
+
+            with LOG_FILE.open("a", newline="") as f:
+                csv.writer(f).writerow(
+                    [ts, avg_speed, avg_wait, total_queue, switched]
                 )
 
-                write_state()
-                next_decision += DECISION_INTERVAL_S
-            # ---------------------------------------------
+            logging.info(
+                f"📊 tick={K} | wall={ts:.0f} | "
+                f"simt={sim_t:.1f} | speed={avg_speed:.2f} "
+                f"wait={avg_wait:.1f} queue={total_queue} action={switched}"
+            )
 
-            # --- KPI logging by WALL-CLOCK with catch-up (aligned grid) ---
-            now = time.time()
-            while now >= next_log_wall:
-                try:
-                    total_speed = 0.0
-                    total_wait  = 0.0
-                    total_queue = 0
-                    n = len(EDGES_IN) or 1
-                    for e in EDGES_IN:
-                        total_speed += traci.edge.getLastStepMeanSpeed(e)
-                        total_wait  += traci.edge.getWaitingTime(e)
-                        total_queue += traci.edge.getLastStepHaltingNumber(e)
-                    avg_speed = total_speed / n
-                    avg_wait  = total_wait  / n
+            # tiny sleep just to avoid pegging CPU
+            time.sleep(0.001)
 
-                    with LOG_FILE.open("a", newline="") as f:
-                        csv.writer(f).writerow([next_log_wall, avg_speed, avg_wait, total_queue, switch_since_last_log])
+        logging.info(f"RL DONE (600s strict run) — ticks={K+1}/{n_steps}")
+        traci.close(False)
+        return 0
 
-                    # clear after writing
-                    switch_since_last_log = 0
-
-                    logging.info(
-                        f"📊 wall={next_log_wall:.0f} | simt={simt:.1f} | "
-                        f"AvgSpeed={avg_speed:.2f} | Wait={avg_wait:.1f}s | "
-                        f"Queue={total_queue} | action={last_action}"
-                    )
-                except Exception as e:
-                    logging.debug(f"KPI fetch skipped: {e}")
-
-                next_log_wall += LOG_INTERVAL
-            # ----------------------------------------------------------------------
-
-            # End by wall-clock first (if set)
-            if wall_deadline and time.time() >= wall_deadline:
-                logging.info(f"Reached WALL_DURATION_S={WALL_DURATION_S:.0f}s — ending RL episode.")
-                traci.close(False)
-                return 0
-
-            # Optional sim cap
-            if SIM_DURATION > 0 and simt >= SIM_DURATION:
-                logging.info(f"Reached SIM_DURATION={SIM_DURATION:.1f}s — ending RL episode.")
-                traci.close(False)
-                return 0
-
-            # Small cooperative sleep
-            time.sleep(0.005)
-
-    finally:
+    except Exception as e:
+        logging.error(f"💥 RL fatal error: {e}", exc_info=True)
         try:
             traci.close(False)
-            logging.info("SUMO closed.")
         except Exception:
             pass
+        return 1
 
-    return 0
 
-# ----------------------------------------------------------------------
-# ENTRYPOINT
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------
+# ENTRY
+# ------------------------------------------------------------
 if __name__ == "__main__":
-    if ONE_SHOT:
-        rc = main()
-        archive_kpi()
-        sys.exit(rc)
-    else:
-        # Legacy looping mode: run forever, archive each episode
-        while True:
-            try:
-                rc = main()
-                archive_kpi()
-                logging.info("Episode finished — restarting in 10 min.")
-                time.sleep(600)
-            except Exception as e:
-                logging.error(f"[controller] crashed: {e}", exc_info=True)
-                time.sleep(5)
+    sys.exit(main())

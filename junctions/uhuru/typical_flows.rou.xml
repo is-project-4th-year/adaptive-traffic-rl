@@ -1,37 +1,37 @@
 <routes>
   <!-- calmer lane-change to avoid “wrong lane” stalls -->
   <vType id="car" accel="2.6" decel="4.5" sigma="0.5" length="5" maxSpeed="13.9"
-         laneChangeModel="LC2013" lcStrategic="0.6" lcCooperative="0.6" lcSpeedGain="0.3" lcKeepRight="0.0"/>
+         laneChangeModel="LC2013" lcStrategic="0.6" lcCooperative="0.6" lcSpeedGain="0.3" lcKeepRight="0"/>
 
   <!-- N origin -->
-  <flow id="N_to_S_tr" from="N_in" to="S_out" begin="0" end="7200" vehsPerHour="600"
+  <flow id="N_to_S_tr" from="N_in" to="S_out" begin="0" end="7200" vehsPerHour="400"
         type="car" departLane="best" departSpeed="max" arrivalLane="current"/>
-  <flow id="N_to_E_left" from="N_in" to="E_out" begin="0" end="7200" vehsPerHour="300"
+  <flow id="N_to_E_left" from="N_in" to="E_out" begin="0" end="7200" vehsPerHour="200"
         type="car" departLane="best" departSpeed="max" arrivalLane="current"/>
-  <flow id="N_to_W_right" from="N_in" to="W_out" begin="0" end="7200" vehsPerHour="300"
+  <flow id="N_to_W_right" from="N_in" to="W_out" begin="0" end="7200" vehsPerHour="200"
         type="car" departLane="best" departSpeed="max" arrivalLane="current"/>
 
   <!-- S origin -->
-  <flow id="S_to_N_tr" from="S_in" to="N_out" begin="0" end="7200" vehsPerHour="600"
+  <flow id="S_to_N_tr" from="S_in" to="N_out" begin="0" end="7200" vehsPerHour="400"
         type="car" departLane="best" departSpeed="max" arrivalLane="current"/>
-  <flow id="S_to_W_left" from="S_in" to="W_out" begin="0" end="7200" vehsPerHour="300"
+  <flow id="S_to_W_left" from="S_in" to="W_out" begin="0" end="7200" vehsPerHour="200"
         type="car" departLane="best" departSpeed="max" arrivalLane="current"/>
-  <flow id="S_to_E_right" from="S_in" to="E_out" begin="0" end="7200" vehsPerHour="300"
+  <flow id="S_to_E_right" from="S_in" to="E_out" begin="0" end="7200" vehsPerHour="200"
         type="car" departLane="best" departSpeed="max" arrivalLane="current"/>
 
   <!-- E origin -->
-  <flow id="E_to_W_tr" from="E_in" to="W_out" begin="0" end="7200" vehsPerHour="600"
+  <flow id="E_to_W_tr" from="E_in" to="W_out" begin="0" end="7200" vehsPerHour="400"
         type="car" departLane="best" departSpeed="max" arrivalLane="current"/>
-  <flow id="E_to_S_left" from="E_in" to="S_out" begin="0" end="7200" vehsPerHour="300"
+  <flow id="E_to_S_left" from="E_in" to="S_out" begin="0" end="7200" vehsPerHour="200"
         type="car" departLane="best" departSpeed="max" arrivalLane="current"/>
-  <flow id="E_to_N_right" from="E_in" to="N_out" begin="0" end="7200" vehsPerHour="300"
+  <flow id="E_to_N_right" from="E_in" to="N_out" begin="0" end="7200" vehsPerHour="200"
         type="car" departLane="best" departSpeed="max" arrivalLane="current"/>
 
   <!-- W origin -->
-  <flow id="W_to_E_tr" from="W_in" to="E_out" begin="0" end="7200" vehsPerHour="600"
+  <flow id="W_to_E_tr" from="W_in" to="E_out" begin="0" end="7200" vehsPerHour="400"
         type="car" departLane="best" departSpeed="max" arrivalLane="current"/>
-  <flow id="W_to_N_left" from="W_in" to="N_out" begin="0" end="7200" vehsPerHour="300"
+  <flow id="W_to_N_left" from="W_in" to="N_out" begin="0" end="7200" vehsPerHour="200"
         type="car" departLane="best" departSpeed="max" arrivalLane="current"/>
-  <flow id="W_to_S_right" from="W_in" to="S_out" begin="0" end="7200" vehsPerHour="300"
+  <flow id="W_to_S_right" from="W_in" to="S_out" begin="0" end="7200" vehsPerHour="200"
         type="car" departLane="best" departSpeed="max" arrivalLane="current"/>
 </routes>

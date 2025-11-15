@@ -1,0 +1,30 @@
+{
+  "poll_seconds": 300,
+  "routingPreference": "TRAFFIC_AWARE",
+  "segments": [
+    {
+      "id": "N_approach",
+      "origin":  {"lat": -1.290115, "lng": 36.819170},
+      "dest":    {"lat": -1.292541, "lng": 36.820446},
+      "distance_m": 288
+    },
+    {
+      "id": "S_approach",
+      "origin":  {"lat": -1.295285, "lng": 36.821862},
+      "dest":    {"lat": -1.292940, "lng": 36.820416},
+      "distance_m": 295
+    },
+    {
+      "id": "E_approach",
+      "origin":  {"lat": -1.293300, "lng": 36.817458},
+      "dest":    {"lat": -1.292662, "lng": 36.820179},
+      "distance_m": 288
+    },
+    {
+      "id": "W_approach",
+      "origin":  {"lat": -1.291597, "lng": 36.823101},
+      "dest":    {"lat": -1.292813, "lng": 36.820715},
+      "distance_m": 284
+    }
+  ]
+}
