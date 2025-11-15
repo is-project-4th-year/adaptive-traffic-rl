@@ -1,7 +1,7 @@
 <configuration>
     <input>
         <net-file value="cross.net.xml"/>
-        <route-files value="typical.rou.xml"/>
+        <route-files value="typical_flows.rou.xml"/>
         <additional-files value="detectors.add.xml"/>
     </input>
 

@@ -1,41 +1,89 @@
+# ------------------------------
 # Python
+# ------------------------------
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.bak
-
-# Virtual environment
-.venv/
-env/
-venv/
-
-# Logs & output
-logs/
+*.pyc
+*.so
+*.egg-info/
 *.log
-*.csv
-*.json
-*.out
-*.err
 
-# Models & data
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Jupyter junk
+.ipynb_checkpoints/
+.jupyter/
+*.ipynb
+.cache/
+
+# ------------------------------
+# Node / React
+# ------------------------------
+dash_public/node_modules/
+dash_public/dist/
+dash_public/build/
+dash_public/.vite/
+dash_public/.cache/
+dash_public/*.zip
+
+# Environment files
+dash_public/.env
+.env
+.env.*
+
+# ------------------------------
+# SUMO Generated Data
+# ------------------------------
+shared/*.json
+shared/tmp*
+shared/state.json
+shared/action.json
+shared/pair_sync.json
+
+episodes/
+logs/
+*.csv
+*.xml~
+
+
+# SUMO detector explosions (your 3–4GB corrupted XMLs)
+junctions/**/uhuru/*.xml
+junctions/**/uhuru/*queue*.xml
+junctions/**/uhuru/*sed*
+
+# Network variants & backup folders
+junctions/uhuru_both/
+junctions/**/stress*.xml
+
+# ------------------------------
+# Models (huge, do NOT push)
+# ------------------------------
 models/*.h5
 models/*.weights.h5
-shared/
-*.npy
-*.npz
+models/*.json
 
-# System files
+# ------------------------------
+# Build artifacts
+# ------------------------------
+*.out
+*.bin
+*.dat
+*.cache
+
+# ------------------------------
+# Mac / OS
+# ------------------------------
 .DS_Store
-*.swp
-.idea/
-.vscode/
-junctions/uhuru_baseline/uhuru/*.xml
-junctions/uhuru_rl/*.xml
 
-junctions/**/uhuru/det_*_queue.xml
-junctions/**/uhuru/sed*
-junctions/**/uhuru_both/uhuru/*
-junctions/**/uhuru_baseline/uhuru/*
-*.xml~
+# ------------------------------
+# VS Code / IDE
+# ------------------------------
+.vscode/
+.idea/
 

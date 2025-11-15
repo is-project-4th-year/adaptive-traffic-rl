@@ -1,0 +1,6 @@
+<additional>
+  <flow id="flow_N_in" from="N_in" to="J0" begin="0" end="7200" departLane="free" departSpeed="max" vehsPerHour="700"/>
+  <flow id="flow_S_in" from="S_in" to="J0" begin="0" end="7200" departLane="free" departSpeed="max" vehsPerHour="700"/>
+  <flow id="flow_E_in" from="E_in" to="J0" begin="0" end="7200" departLane="free" departSpeed="max" vehsPerHour="700"/>
+  <flow id="flow_W_in" from="W_in" to="J0" begin="0" end="7200" departLane="free" departSpeed="max" vehsPerHour="700"/>
+</additional>

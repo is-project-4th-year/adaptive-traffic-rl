@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!-- generated on 2025-11-15 13:37:41 by Eclipse SUMO sumo Version 1.12.0
+<configuration xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:noNamespaceSchemaLocation="http://sumo.dlr.de/xsd/sumoConfiguration.xsd">
+
+    <input>
+        <net-file value="/home/azureuser/traffic_rl/junctions/uhuru_baseline/cross.net.xml"/>
+        <route-files value="/home/azureuser/traffic_rl/junctions/uhuru_baseline/dynamic_flows.rou.xml"/>
+        <additional-files value="/home/azureuser/traffic_rl/junctions/uhuru_baseline/detectors.add.xml"/>
+    </input>
+
+    <time>
+        <begin value="0"/>
+        <end value="900"/>
+        <step-length value="1.0"/>
+    </time>
+
+    <processing>
+        <scale value="0.7"/>
+    </processing>
+
+    <report>
+        <verbose value="true"/>
+        <no-warnings value="true"/>
+        <no-step-log value="true"/>
+    </report>
+
+    <traci_server>
+        <remote-port value="48115"/>
+    </traci_server>
+
+    <random_number>
+        <seed value="489778"/>
+    </random_number>
+
+    <gui_only>
+        <quit-on-end value="true"/>
+        <start value="true"/>
+        <tracker-interval value="1.0"/>
+    </gui_only>
+
+</configuration>

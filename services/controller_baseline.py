@@ -1,46 +1,80 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Baseline SUMO Controller (Embedded Mode)
+Baseline SUMO Controller — STRICT 600s Paired Episode Mode
+-----------------------------------------------------------
 - Fixed-cycle benchmark controller
-- Logs KPIs on a WALL-CLOCK aligned grid (every LOG_INTERVAL seconds)
-- Timestamp = epoch seconds (float)
-- ONE_SHOT=1 archives KPI at the end of an episode
-- WALL_DURATION_S: optional wall-clock cap to end by real time
+- Reads shared/pair_sync.json written by day_runner.py
+- Waits until start_at_epoch (wall-clock)
+- Runs SUMO at full speed (tiny sleep)
+- Logs KPIs exactly every STEP_S seconds (wall-clock)
+- Produces EXACTLY n_steps rows, aligned with RL controller
+
+KPI schema:
+    timestamp, avg_speed, avg_wait, queue_len, action
+where:
+    action = 1 if a phase switch happened since last tick, else 0
 """
 
 import os
 import sys
 import time
-import logging
-from pathlib import Path
+import json
 import csv
-import shutil
+import logging
+import signal
+from pathlib import Path
 
 import traci
 
-# ----------------------------------------------------------------------------- #
-# CONFIG
-# ----------------------------------------------------------------------------- #
-LOG_DIR = os.path.expanduser("~/traffic_rl/logs")
-Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+# ------------------------------------------------------------
+# PATHS / CONSTANTS
+# ------------------------------------------------------------
+ROOT = str(Path.home()) + "/traffic_rl"
 
-# Env-driven knobs
-ONE_SHOT = os.getenv("ONE_SHOT", "0") == "1"
-ARCHIVE_PREFIX = os.getenv("ARCHIVE_PREFIX", "baseline")
-SUMO_BINARY = os.getenv("SUMO_BINARY", "/usr/bin/sumo")
-SUMO_CFG = os.getenv("SUMO_CFG", "/home/azureuser/traffic_rl/junctions/uhuru_baseline/live.sumocfg")
-SUMO_SEED = os.getenv("SUMO_SEED", "123")
-KPI_FILE = os.getenv("KPI_FILE", os.path.join(LOG_DIR, "kpi_baseline.csv"))
+SYNC_PATH = os.environ.get(
+    "PAIR_SYNC",
+    f"{ROOT}/shared/pair_sync.json"
+)
 
-TLS_ID = os.getenv("TLS_ID", "J0")
-STEP_LENGTH = float(os.getenv("STEP_LENGTH", "1.0"))
-CYCLE_TIME = float(os.getenv("CYCLE_TIME", "30"))  # seconds, fixed-cycle
+LOG_DIR = Path(os.environ.get("LOG_DIR", f"{ROOT}/logs"))
+KPI_FILE = Path(os.environ.get("KPI_FILE", LOG_DIR / "kpi_baseline.csv"))
+
+SUMO_BINARY = os.environ.get("SUMO_BINARY", "/usr/bin/sumo")
+SUMO_CFG = os.environ.get(
+    "SUMO_CFG",
+    f"{ROOT}/junctions/uhuru_baseline/live.sumocfg",
+)
+SUMO_SEED = os.environ.get("SUMO_SEED", "123")
+DEMAND_SCALE = os.environ.get("DEMAND_SCALE", "")
+TLS_ID = os.environ.get("TLS_ID", "J0")
+STEP_LENGTH = float(os.environ.get("STEP_LENGTH", "1.0"))
+CYCLE_TIME = float(os.environ.get("CYCLE_TIME", "30.0"))  # fixed cycle length (sim seconds)
+
+# Paired episode timing
+EPISODE_LEN_S = 600      # must match day_runner
+STEP_S        = 5        # will be overwritten by pair_sync
+NEXT_TICK     = None     # function(k) -> wall_epoch
+K             = 0        # tick index
+
+RUNNING = True
+
+# Fixed green phases (simple two-phase plan)
 GREEN_PHASES = [0, 2]
 
-LOG_INTERVAL = float(os.getenv("LOG_INTERVAL", "5.0"))
-SIM_DURATION = float(os.getenv("SIM_DURATION", "600"))
-WALL_DURATION_S = float(os.getenv("WALL_DURATION_S", "0"))
+# ------------------------------------------------------------
+# SIGNAL HANDLER
+# ------------------------------------------------------------
+def _sig_handler(sig, frame):
+    global RUNNING
+    RUNNING = False
 
+signal.signal(signal.SIGINT, _sig_handler)
+signal.signal(signal.SIGTERM, _sig_handler)
+
+# ------------------------------------------------------------
+# LOGGING
+# ------------------------------------------------------------
 logging.basicConfig(
     stream=sys.stdout,
     level=logging.INFO,
@@ -48,190 +82,197 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-# ----------------------------------------------------------------------------- #
-# UTILITIES
-# ----------------------------------------------------------------------------- #
-def ensure_kpi_header(path: str) -> None:
-    """Ensure file exists but write no header (paired_rollup expects numeric rows)."""
-    p = Path(path)
-    if not p.exists():
-        p.touch()
+# ------------------------------------------------------------
+# SYNC SETUP
+# ------------------------------------------------------------
+def sync_setup():
+    """
+    Read pair_sync.json, block until start_at_epoch, and define NEXT_TICK(k).
+    """
+    global NEXT_TICK, STEP_S
 
+    if not os.path.exists(SYNC_PATH):
+        raise RuntimeError(f"pair_sync.json missing at {SYNC_PATH}")
 
-def archive_kpi() -> None:
-    """Archive KPI and reset the live CSV (no header)."""
-    try:
-        src = Path(KPI_FILE)
-        if src.exists() and src.stat().st_size > 0:
-            stamp = time.strftime("%Y%m%d_%H%M%S")
-            dst = src.parent / f"kpi_{ARCHIVE_PREFIX}_{stamp}.csv"
-            shutil.copy2(src, dst)
-            src.write_text("")  # reset without header
-            logging.info(f"Archived KPI → {dst} (live file reset)")
-    except Exception as e:
-        logging.warning(f"Could not archive KPI: {e}")
+    with open(SYNC_PATH) as f:
+        sync = json.load(f)
 
+    start_at = float(sync["start_at_epoch"])
+    STEP_S   = int(sync["step_seconds"])
 
-def _align_next(now: float, interval: float) -> float:
-    """Return next epoch second aligned to interval grid (e.g., 0,5,10...)."""
-    return (int(now // interval) + 1) * interval
+    # Hard wait until aligned start
+    while True:
+        dt = start_at - time.time()
+        if dt <= 0.02:
+            break
+        time.sleep(min(dt, 0.05))
 
-# ----------------------------------------------------------------------------- #
-# CORE LOOP
-# ----------------------------------------------------------------------------- #
-def run_episode() -> int:
-    """Run one baseline SUMO episode with wall-clock KPI logging."""
-    logging.info("=" * 70)
-    logging.info("🚦 Starting Baseline Controller (Embedded SUMO Mode)")
-    logging.info(f"Config: SUMO={SUMO_BINARY}, CFG={SUMO_CFG}, SEED={SUMO_SEED}")
+    def _tick(k: int) -> float:
+        return start_at + k * STEP_S
+
+    NEXT_TICK = _tick
     logging.info(
-        f"Cycle={CYCLE_TIME}s, Step={STEP_LENGTH}s, TLS={TLS_ID}, "
-        f"SimCap={SIM_DURATION:.0f}s, WallCap={WALL_DURATION_S:.0f}s, LogInterval={LOG_INTERVAL:.0f}s"
+        f"[baseline-sync] start_at={start_at:.0f}, step_seconds={STEP_S}"
     )
-    logging.info("=" * 70)
+    return start_at
 
-    ensure_kpi_header(KPI_FILE)
 
+# ------------------------------------------------------------
+# KPI HEADER
+# ------------------------------------------------------------
+def ensure_kpi_header():
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    if not KPI_FILE.exists() or KPI_FILE.stat().st_size < 20:
+        with KPI_FILE.open("w", newline="") as f:
+            csv.writer(f).writerow(
+                ["timestamp", "avg_speed", "avg_wait", "queue_len", "action"]
+            )
+
+
+# ------------------------------------------------------------
+# EDGE DISCOVERY
+# ------------------------------------------------------------
+def discover_inbound_edges(tls_id: str):
+    try:
+        links = traci.trafficlight.getControlledLinks(tls_id)
+        lanes = {l[0][0] for l in links if l and l[0]}
+        edges = sorted({traci.lane.getEdgeID(l) for l in lanes})
+        return edges
+    except Exception as e:
+        logging.warning(f"could not discover inbound edges: {e}")
+        return []
+
+
+# ------------------------------------------------------------
+# MAIN EPISODE LOOP (STRICT 600s)
+# ------------------------------------------------------------
+# MAIN EPISODE LOOP (STRICT 600s)
+# ------------------------------------------------------------
+def run_episode() -> int:
+    global K
+
+    logging.info("=" * 72)
+    logging.info("🚦 Baseline Controller — strict paired mode start")
+    logging.info(f"CFG={SUMO_CFG}, SEED={SUMO_SEED}, TLS={TLS_ID}")
+    logging.info("=" * 72)
+
+    ensure_kpi_header()
+    start_at = sync_setup()  # defines NEXT_TICK + STEP_S
+
+    # Launch SUMO
     sumo_cmd = [
         SUMO_BINARY,
         "-c", SUMO_CFG,
         "--no-step-log",
         "--step-length", str(STEP_LENGTH),
-        "--start",
+        "--start", "true",
         "--quit-on-end", "true",
         "--seed", str(SUMO_SEED),
     ]
+    if DEMAND_SCALE:
+        sumo_cmd += ["--scale", str(DEMAND_SCALE)]
 
+    logging.info("⚙️ launching SUMO for baseline…")
+    traci.start(sumo_cmd)
+    time.sleep(0.3)
+    traci.simulationStep()
+    logging.info("✅ connected to TraCI (baseline)")
+
+    # Fixed-cycle init
+    phase_idx = GREEN_PHASES[0]
+    traci.trafficlight.setPhase(TLS_ID, phase_idx)
+    next_switch_simt = CYCLE_TIME
+    logging.info(f"🟢 initial phase={phase_idx}")
+
+    # Controlled edges
+    edges = discover_inbound_edges(TLS_ID)
+    logging.info(f"inbound edges={edges}")
+
+    # Strict tick plan
+    n_steps = EPISODE_LEN_S // STEP_S
+    steps_per_tick = max(1, int(round(STEP_S / STEP_LENGTH)))
+    K = 0
+
+    logging.info(
+        f"[baseline] running {n_steps} ticks @ {STEP_S}s "
+        f"({steps_per_tick} sim-steps per tick, step_length={STEP_LENGTH})"
+    )
+
+    # ----------------------------------------------------------------------
+    # MAIN LOOP (STRICT WALL-CLOCK TIMING)
+    # ----------------------------------------------------------------------
     try:
-        logging.info("⚙️  Launching SUMO embedded via TraCI…")
-        traci.start(sumo_cmd)
-        logging.info("✅ SUMO launched. Connected to TraCI.")
+        for K in range(n_steps):
+            if not RUNNING:
+                break
 
-        # Fixed-cycle control init
-        phase_idx = GREEN_PHASES[0]
-        next_switch_simt = CYCLE_TIME
-        traci.trafficlight.setPhase(TLS_ID, phase_idx)
-        logging.info(f"🟢 Initial phase set to {phase_idx} on {TLS_ID}")
+            # 1. Advance SUMO simulation
+            for _ in range(steps_per_tick):
+                traci.simulationStep()
 
-        # Controlled inbound edges
-        edges = []
-        try:
-            links = traci.trafficlight.getControlledLinks(TLS_ID)
-            lanes = sorted({l[0][0] for l in links if l and l[0]})
-            edges = sorted({traci.lane.getEdgeID(l) for l in lanes})
-            logging.info(f"Inbound edges: {edges}")
-        except Exception as e:
-            logging.warning(f"Could not detect inbound edges: {e}")
-
-        # Timing setup
-        sim_start_wall = time.time()
-        wall_deadline = sim_start_wall + WALL_DURATION_S if WALL_DURATION_S > 0 else None
-        next_log_wall = _align_next(time.time(), LOG_INTERVAL)
-        simt = 0.0
-        empty_ticks = 0
-        switch_since_last_log = 0
-
-        # --------------------------------------------------------------------- #
-        # MAIN LOOP
-        # --------------------------------------------------------------------- #
-        while True:
-            traci.simulationStep()
             simt = traci.simulation.getTime()
 
-            # WALL-TIME END CAP
-            if wall_deadline and time.time() >= wall_deadline:
-                logging.info(f"Reached WALL_DURATION_S={WALL_DURATION_S:.0f}s — ending baseline episode.")
-                break
-
-            # Graceful empty-traffic handling (don’t end instantly)
-            if traci.simulation.getMinExpectedNumber() <= 0:
-                empty_ticks += 1
-            else:
-                empty_ticks = 0
-            if empty_ticks * STEP_LENGTH >= 5.0 and (time.time() - sim_start_wall) >= 20.0:
-                logging.info("Traffic empty for 5s after warm-up — ending episode.")
-                break
-
-            # Fixed-cycle switching
+            # 2. Fixed-cycle switching logic
             if simt >= next_switch_simt:
-                i = GREEN_PHASES.index(phase_idx)
-                phase_idx = GREEN_PHASES[(i + 1) % len(GREEN_PHASES)]
+                try:
+                    idx = GREEN_PHASES.index(phase_idx)
+                except ValueError:
+                    idx = 0
+
+                phase_idx = GREEN_PHASES[(idx + 1) % len(GREEN_PHASES)]
                 traci.trafficlight.setPhase(TLS_ID, phase_idx)
                 next_switch_simt += CYCLE_TIME
-                switch_since_last_log = 1
-                logging.info(f"🔁 Switched phase → {phase_idx} at simt={simt:.1f}s")
+                switched_flag = 1
+            else:
+                switched_flag = 0
 
-            # KPI logging on wall-clock
-            now = time.time()
-            while now >= next_log_wall:
-                try:
-                    total_queue = 0
-                    total_wait = 0.0
-                    total_speed = 0.0
-                    n = 0
+            # 3. KPI sampling
+            total_speed = 0.0
+            total_wait = 0.0
+            total_queue = 0
+            n = len(edges) or 1
 
-                    for e in edges:
-                        total_queue += traci.edge.getLastStepHaltingNumber(e)
-                        total_wait += traci.edge.getWaitingTime(e)
-                        total_speed += traci.edge.getLastStepMeanSpeed(e)
-                        n += 1
+            for e in edges:
+                total_speed += traci.edge.getLastStepMeanSpeed(e)
+                total_wait += traci.edge.getWaitingTime(e)
+                total_queue += traci.edge.getLastStepHaltingNumber(e)
 
-                    avg_speed = (total_speed / n) if n else 0.0
-                    avg_wait = (total_wait / n) if n else 0.0
+            avg_speed = total_speed / n
+            avg_wait = total_wait / n
 
-                    with open(KPI_FILE, "a", newline="") as f:
-                        csv.writer(f).writerow([next_log_wall, avg_speed, avg_wait, total_queue, switch_since_last_log])
+            # 4. WALL-CLOCK GATE (REAL 5-SECOND TICK)
+            target = NEXT_TICK(K)
+            while time.time() < target:
+                time.sleep(0.05)
 
-                    logging.info(
-                        f"📊 wall={next_log_wall:.0f} | simt={simt:.1f} | "
-                        f"AvgSpeed={avg_speed:.2f} | Wait={avg_wait:.1f}s | "
-                        f"Queue={total_queue} | action={switch_since_last_log}"
-                    )
-                    switch_since_last_log = 0
-                except Exception as e:
-                    logging.debug(f"KPI fetch skipped: {e}")
+            # 5. Write KPI row
+            ts = target
+            with KPI_FILE.open("a", newline="") as f:
+                csv.writer(f).writerow(
+                    [ts, avg_speed, avg_wait, total_queue, switched_flag]
+                )
 
-                next_log_wall += LOG_INTERVAL
+            logging.info(
+                f"📊 tick={K} | wall={ts:.0f} | simt={simt:.1f} | "
+                f"speed={avg_speed:.2f} | wait={avg_wait:.1f} | "
+                f"queue={total_queue} | switched={switched_flag}"
+            )
 
-            time.sleep(0.005)
-
-        logging.info("✅ Simulation finished. Closing SUMO connection…")
+        logging.info(f"baseline episode done — ticks={K+1}/{n_steps}")
         traci.close(False)
-        elapsed = time.time() - sim_start_wall
-        logging.info(f"🧹 SUMO closed. Wall time={elapsed:.1f}s, simt={simt:.1f}s")
         return 0
 
     except Exception as e:
-        logging.error(f"💥 Fatal error in baseline loop: {e}", exc_info=True)
+        logging.error(f"💥 baseline fatal error: {e}", exc_info=True)
         try:
             traci.close(False)
         except Exception:
             pass
         return 1
 
-
-# ----------------------------------------------------------------------------- #
+# ------------------------------------------------------------
 # ENTRYPOINT
-# ----------------------------------------------------------------------------- #
+# ------------------------------------------------------------
 if __name__ == "__main__":
-    if ONE_SHOT:
-        rc = run_episode()
-        archive_kpi()
-        sys.exit(rc)
-    else:
-        while True:
-            try:
-                rc = run_episode()
-                archive_kpi()
-            except KeyboardInterrupt:
-                logging.info("🛑 Interrupted manually, shutting down baseline controller.")
-                try:
-                    traci.close(False)
-                except Exception:
-                    pass
-                sys.exit(0)
-            except Exception as e:
-                logging.error(f"[baseline] ⚠️ Exception occurred: {e}", exc_info=True)
-
-            logging.info("[baseline] 🔁 Episode finished — restarting in 5 seconds…")
-            time.sleep(5)
+    rc = run_episode()
+    sys.exit(rc)

@@ -1,0 +1,23 @@
+<additional>
+  <tlLogic id="J0" type="static" programID="baseline_protected" offset="0">
+    <!-- 1) NS through+right -->
+    <phase duration="35"   state="GGrrrrGGrrrr"/>
+    <phase duration="4"    state="yyrrrryyrrrr"/>
+    <phase duration="2" state="rrrrrrrrrrrr"/>
+
+    <!-- 2) NS left only -->
+    <phase duration="20"    state="rrGrrrrrGrrr"/>
+    <phase duration="4"    state="rryrrrrryrrr"/>
+    <phase duration="2" state="rrrrrrrrrrrr"/>
+
+    <!-- 3) EW through+right -->
+    <phase duration="35"   state="rrrGGrrrrGGr"/>
+    <phase duration="4"    state="rrryyrrrryyr"/>
+    <phase duration="2" state="rrrrrrrrrrrr"/>
+
+    <!-- 4) EW left only -->
+    <phase duration="20"    state="rrrrrGrrrrrG"/>
+    <phase duration="4"    state="rrrrryrrrrry"/>
+    <phase duration="2" state="rrrrrrrrrrrr"/>
+  </tlLogic>
+</additional>

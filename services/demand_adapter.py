@@ -1,64 +1,144 @@
 #!/usr/bin/env python3
-import os, json, time
-from datetime import datetime, timezone
+import json
+from pathlib import Path
 
-GMAPS = os.environ.get("GMAPS_JSON", os.path.expanduser("~/traffic_rl/shared/live_speeds.json"))
-OUT   = os.environ.get("FLOWS_ADD",  os.path.expanduser("~/traffic_rl/junctions/uhuru/flows.add.xml"))
+# ----------------------------------------------------------------------
+# PATHS
+# ----------------------------------------------------------------------
+LIVE_SPEEDS = Path("/home/azureuser/traffic_rl/shared/live_speeds.json")
 
-# Map segment id -> incoming edge id in your net
-EDGE_MAP = {
-    "N_approach": "N_in",
-    "S_approach": "S_in",
-    "E_approach": "E_in",
-    "W_approach": "W_in",
+OUTPUT_RL = Path("/home/azureuser/traffic_rl/junctions/uhuru_rl/dynamic_flows.rou.xml")
+OUTPUT_BASE = Path("/home/azureuser/traffic_rl/junctions/uhuru_baseline/dynamic_flows.rou.xml")
+
+# 🔥 Episode duration
+FLOW_END_TIME = 900  # 600s episode + 300s buffer
+
+# 🔥 BALANCED BASE FLOWS for 2-lane intersection
+# These numbers MUST be sustainable without gridlock
+# Typical 2-lane capacity: ~700-800 vph per direction
+# 🔥 BALANCED BASE FLOWS for 2-lane intersection
+# Increased for sustained congestion during RL testing
+BASE_VPH = {
+    # HIGH STRESS test flows (~600 vph per approach)
+    "N_to_S_tr": 400,
+    "N_to_E_left": 100,
+    "N_to_W_right": 100,
+
+    "S_to_N_tr": 400,
+    "S_to_W_left": 100,
+    "S_to_E_right": 100,
+
+    "E_to_W_tr": 400,
+    "E_to_S_left": 100,
+    "E_to_N_right": 100,
+
+    "W_to_E_tr": 400,
+    "W_to_N_left": 100,
+    "W_to_S_right": 100,
+}
+# Connection mapping
+GMAPS_TO_SUMO = {
+    "N": ["N_to_S_tr", "N_to_E_left", "N_to_W_right"],
+    "S": ["S_to_N_tr", "S_to_W_left", "S_to_E_right"],
+    "E": ["E_to_W_tr", "E_to_S_left", "E_to_N_right"],
+    "W": ["W_to_E_tr", "W_to_N_left", "W_to_S_right"],
 }
 
-BASE_VPH = 700          # baseline vehicles/hour/edge
-DELAY_REF = 120.0       # seconds for ~1x scaling
-CLAMP = (0.5, 2.0)      # min/max scale
+# Congestion scaling limits
+MIN_SCALE = 0.3    # don't go below 30% (floor)
+MAX_SCALE = 1.5    # don't exceed 150% (prevent gridlock)
 
-def clamp(x,a,b): return max(a, min(b, x))
+# SUMO max capacity per turning movement
+MAX_VPH = 500
 
-def compute_scale(delay_s):
-    # Simple: 1 + delay/DELAY_REF, clamped
-    return clamp(1.0 + (delay_s or 0.0)/DELAY_REF, CLAMP[0], CLAMP[1])
+# ----------------------------------------------------------------------
+# LOAD CONGESTION
+# ----------------------------------------------------------------------
+def load_congestion():
+    """
+    Loads segment-based congestion from Google Maps live_speeds.json.
+    Returns direction ratios: {"N":x, "S":y, "E":z, "W":u}.
+    """
+    if not LIVE_SPEEDS.exists():
+        return {"N":1.0, "S":1.0, "E":1.0, "W":1.0}
 
-def read_gmaps(path):
-    try:
-        with open(path) as f: return json.load(f)
-    except Exception:
-        return None
+    d = json.loads(LIVE_SPEEDS.read_text())
+    segs = d.get("segments", [])
 
-def main():
-    data = read_gmaps(GMAPS)
-    segs = (data or {}).get("segments", [])
-    scales = {}
+    cong = {"N":1.0, "S":1.0, "E":1.0, "W":1.0}
 
     for seg in segs:
-        sid = seg.get("id")
-        if not sid or "error" in seg: continue
-        delay = seg.get("delay_s")
-        scales[sid] = compute_scale(delay)
+        seg_id = seg["id"]  # e.g. N_approach
+        direction = seg_id.split("_")[0]
 
-    # Build per-edge flows for a 2-hour window (0–7200s) with the scaled VPH
-    # SUMO <flow> has vehsPerHour and departLane="free"
+        dur = float(seg["duration_s"])
+        ff = float(seg["static_duration_s"])
+
+        if ff <= 0:
+            ratio = 1.0
+        else:
+            ratio = dur / ff
+
+        # clamp: keep between MIN_SCALE and MAX_SCALE to prevent overload
+        cong[direction] = max(MIN_SCALE, min(ratio, MAX_SCALE))
+
+    return cong
+
+
+# ----------------------------------------------------------------------
+# BUILD ROUTES XML
+# Use period for continuous spawning + apply congestion scaling
+# ----------------------------------------------------------------------
+def build_xml(cong):
     lines = []
-    lines.append('<additional>')
-    for seg_id, edge in EDGE_MAP.items():
-        scale = scales.get(seg_id, 1.0)
-        vph   = int(BASE_VPH * scale)
-        # unique id per direction
-        lines.append(
-            f'  <flow id="flow_{edge}" from="{edge}" to="J0" begin="0" end="7200" departLane="free" departSpeed="max" vehsPerHour="{vph}"/>'
-        )
-    lines.append('</additional>')
-    xml = "\n".join(lines)
+    lines.append("<routes>")
+    lines.append('  <vType id="car" accel="2.6" decel="4.5" sigma="0.5" length="5" maxSpeed="13.9" '
+                 'laneChangeModel="LC2013" lcStrategic="0.6" lcCooperative="0.6" '
+                 'lcSpeedGain="0.3" lcKeepRight="0"/>')
+    lines.append("")
 
-    os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    with open(OUT, "w") as f: f.write(xml)
+    for direction, flows in GMAPS_TO_SUMO.items():
+        scale = cong[direction]
 
-    now = datetime.now(timezone.utc).isoformat()
-    print(f"[adapter] wrote {OUT} at {now}")
+        for flow_id in flows:
+            base_vph = BASE_VPH[flow_id]
+            scaled_vph = int(base_vph * scale)
+
+            # CAP to prevent gridlock
+            final_vph = min(scaled_vph, MAX_VPH)
+
+            # Convert vph to period (seconds between vehicles)
+            period = 3600.0 / max(final_vph, 1)
+
+            frm = flow_id.split("_")[0]   # N_to_S_tr → N
+            to = flow_id.split("_")[2]    # N_to_S_tr → S
+
+            lines.append(
+                f'  <flow id="{flow_id}" from="{frm}_in" to="{to}_out" '
+                f'begin="0" end="{FLOW_END_TIME}" period="{period:.2f}" type="car"/>'
+            )
+
+    lines.append("</routes>")
+    return "\n".join(lines)
+
+
+# ----------------------------------------------------------------------
+# WRITE TWO OUTPUT FILES
+# ----------------------------------------------------------------------
+def write_dynamic_flows(cong):
+    xml = build_xml(cong)
+    OUTPUT_RL.write_text(xml)
+    OUTPUT_BASE.write_text(xml)
+    print("✅ dynamic_flows.rou.xml updated (balanced demand)")
+    print(f"   Congestion scaling: {cong}")
+
+
+# ----------------------------------------------------------------------
+# MAIN
+# ----------------------------------------------------------------------
+def main():
+    cong = load_congestion()
+    write_dynamic_flows(cong)
 
 if __name__ == "__main__":
     main()
