@@ -1,4 +1,3 @@
-Here’s a clean, structured, **rich-text / Markdown-friendly** version. You can drop this straight into a README and tweak headings if you want.
 
 ---
 
@@ -663,3 +662,4 @@ Approximate breakdown:
 * Documentation and cleanup: 2 hours
 
 **Total:** ≈ 14–18 hours of focused work (excluding long training runs).
+
